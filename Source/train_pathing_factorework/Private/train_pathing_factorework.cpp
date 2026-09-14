@@ -29,6 +29,11 @@ DEFINE_LOG_CATEGORY(train_pathing);
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "CollisionQueryParams.h"
+#include "FGTrain.h"
+#include "FGRailroadVehicle.h"
+#include "FGLocomotive.h"
+#include "FGCharacterPlayer.h"
+#include "EngineUtils.h"
 
 // State variables to cache the inspected track
 static FString GInspectedTrackText = TEXT("Looking at Track: [None]");
@@ -37,6 +42,250 @@ static constexpr float TRACE_INTERVAL = 0.2f; // Run raycast every 0.2s
 static AFGBuildableRailroadTrack* lastTrack = nullptr;
 static TArray<TWeakObjectPtr<AActor>> GConnectionMarkerActors;
 static TWeakObjectPtr<AFGBuildableRailroadTrack> GMarkerTrack;
+static TWeakObjectPtr<AFGTrain> GHighlightedTrain;
+static FRailroadPathSharedPtr GHighlightedPath;
+static TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>> GHighlightedPathTracks;
+
+static void StopHighlightedTrainPath()
+{
+    for (TWeakObjectPtr<AFGBuildableRailroadTrack>& Track :
+        GHighlightedPathTracks)
+    {
+        if (Track.IsValid() && Track.Get() != lastTrack)
+        {
+            Track->StopBlockVisualization();
+        }
+    }
+
+    GHighlightedPathTracks.Reset();
+    GHighlightedPath.Reset();
+    GHighlightedTrain.Reset();
+}
+
+static bool ContainsTrack(
+    const TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>>& Tracks,
+    AFGBuildableRailroadTrack* Track)
+{
+    for (const TWeakObjectPtr<AFGBuildableRailroadTrack>& ExistingTrack : Tracks)
+    {
+        if (ExistingTrack.Get() == Track)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static AFGTrain* GetPlayerTrain(AFGPlayerController* PlayerController)
+{
+    if (!PlayerController)
+    {
+        return nullptr;
+    }
+
+    APawn* PlayerPawn = PlayerController->GetPawn();
+
+    // Fall 1: Der Spieler besitzt direkt ein Railroad Vehicle.
+    AFGRailroadVehicle* RailroadVehicle =
+        Cast<AFGRailroadVehicle>(PlayerPawn);
+
+    if (RailroadVehicle && RailroadVehicle->GetTrain())
+    {
+        return RailroadVehicle->GetTrain();
+    }
+
+    // Fall 2: Der Spieler ist weiterhin als Character-Pawn vorhanden
+    // und sitzt als Fahrer in einer Lokomotive.
+    AFGCharacterPlayer* Character =
+        Cast<AFGCharacterPlayer>(PlayerPawn);
+
+    if (!Character || !PlayerController->GetWorld())
+    {
+        return nullptr;
+    }
+
+    for (TActorIterator<AFGLocomotive> Iterator(PlayerController->GetWorld());
+        Iterator;
+        ++Iterator)
+    {
+        AFGLocomotive* Locomotive = *Iterator;
+
+        if (Locomotive &&
+            Locomotive->GetDriver() == Character &&
+            Locomotive->GetTrain())
+        {
+            return Locomotive->GetTrain();
+        }
+    }
+
+    return nullptr;
+}
+
+static void UpdatePlayerTrainPathVisualization(
+    AFGPlayerController* PlayerController)
+{
+    AFGTrain* EnteredTrain = GetPlayerTrain(PlayerController);
+
+    /*
+     * Keep displaying the last train path after the player leaves the train.
+     * When the player enters another train, EnteredTrain replaces the cached
+     * train and the old path is removed below.
+     */
+    AFGTrain* CurrentTrain = EnteredTrain;
+
+    if (!CurrentTrain)
+    {
+        CurrentTrain = GHighlightedTrain.Get();
+    }
+
+    if (!CurrentTrain)
+    {
+        if (GHighlightedPathTracks.Num() > 0)
+        {
+            StopHighlightedTrainPath();
+        }
+
+        return;
+    }
+
+    const FRailroadPathSharedPtr CurrentPath =
+        CurrentTrain->mAtcData.Path;
+
+    if (!CurrentPath.IsValid() ||
+        CurrentPath->PathPoints.Num() == 0)
+    {
+        StopHighlightedTrainPath();
+        return;
+    }
+
+    const int32 PathPointCount = CurrentPath->PathPoints.Num();
+
+    int32 FirstPathPoint = CurrentTrain->mAtcData.CurrentPathSegment;
+
+    /*
+     * CurrentPathSegment is INDEX_NONE while the ATC state is being
+     * initialized. In that case, display the complete path temporarily.
+     */
+    if (FirstPathPoint == INDEX_NONE)
+    {
+        FirstPathPoint = 0;
+    }
+
+    FirstPathPoint = FMath::Clamp(
+        FirstPathPoint,
+        0,
+        PathPointCount - 1
+    );
+
+    TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>>
+        DesiredTracks;
+
+    for (int32 PathPointIndex = FirstPathPoint;
+        PathPointIndex < PathPointCount;
+        ++PathPointIndex)
+    {
+        UFGRailroadTrackConnectionComponent* Connection =
+            CurrentPath->PathPoints[PathPointIndex].TrackConnection.Get();
+
+        if (!Connection)
+        {
+            UE_LOG(
+                train_pathing,
+                Warning,
+                TEXT(
+                    "Train path contains invalid connection at "
+                    "PathPoint[%d]"
+                ),
+                PathPointIndex
+            );
+
+            continue;
+        }
+
+        AFGBuildableRailroadTrack* Track =
+            Connection->GetTrack();
+
+        if (!Track)
+        {
+            UE_LOG(
+                train_pathing,
+                Warning,
+                TEXT(
+                    "Train path connection has no track: "
+                    "PathPoint[%d] Connection=%p"
+                ),
+                PathPointIndex,
+                Connection
+            );
+
+            continue;
+        }
+
+        if (!ContainsTrack(DesiredTracks, Track))
+        {
+            DesiredTracks.Add(Track);
+        }
+    }
+
+    /*
+     * Remove tracks that belonged to the previous path or have already
+     * been passed by the train.
+     */
+    for (TWeakObjectPtr<AFGBuildableRailroadTrack>& OldTrack :
+        GHighlightedPathTracks)
+    {
+        if (!OldTrack.IsValid())
+        {
+            continue;
+        }
+
+        if (!ContainsTrack(DesiredTracks, OldTrack.Get()) &&
+            OldTrack.Get() != lastTrack)
+        {
+            OldTrack->StopBlockVisualization();
+        }
+    }
+
+    /*
+     * Add newly required tracks and restore visualization if the game
+     * disabled it after a track or signal was built.
+     *
+     * DesiredTracks is rebuilt from CurrentTrain->mAtcData.Path on every
+     * update. Therefore passed tracks and tracks from an old path are not
+     * re-enabled.
+     */
+    for (TWeakObjectPtr<AFGBuildableRailroadTrack>& Track :
+        DesiredTracks)
+    {
+        if (!Track.IsValid())
+        {
+            continue;
+        }
+
+        /*
+         * A track can still be part of GHighlightedPathTracks while the
+         * game has removed its block visualization. Restore it in that case.
+         */
+        if (!Track->IsBlockVisualizationActive())
+        {
+            Track->ShowBlockVisualization();
+        }
+    }
+
+    const bool bTrainChanged =
+        GHighlightedTrain.Get() != CurrentTrain;
+
+    const bool bPathChanged =
+        GHighlightedPath.Get() != CurrentPath.Get();
+
+    const bool bProgressChanged =
+        GHighlightedPathTracks.Num() != DesiredTracks.Num();
+
+    GHighlightedTrain = CurrentTrain;
+    GHighlightedPath = CurrentPath;
+    GHighlightedPathTracks = MoveTemp(DesiredTracks);
+}
 
 static void ClearTrackConnectionMarkers()
 {
@@ -285,7 +534,8 @@ static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSecon
         // Bestehende Blockvisualisierung beibehalten.
         if (lastTrack != nTrack)
         {
-            if (lastTrack)
+            if (lastTrack &&
+                !ContainsTrack(GHighlightedPathTracks, lastTrack))
             {
                 lastTrack->StopBlockVisualization();
             }
@@ -298,9 +548,18 @@ static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSecon
     {
         ClearTrackConnectionMarkers();
 
-        if (lastTrack)
+        if (lastTrack &&
+            !ContainsTrack(GHighlightedPathTracks, lastTrack))
         {
             lastTrack->StopBlockVisualization();
+            lastTrack = nullptr;
+        }
+        else if (lastTrack)
+        {
+            /*
+             * The track is still highlighted by the train path.
+             * Only remove the connection markers, not the track highlight.
+             */
             lastTrack = nullptr;
         }
 
@@ -383,7 +642,11 @@ struct FFactorioRailroadAStarFilter : public FRailroadGraphAStarFilter
     float CalculateFactorioPenalty(UFGRailroadTrackConnectionComponent* Conn, float SegmentLength) const
     {
         float Penalty = 0.0f;
-
+        if (Conn && Conn->GetTrack() && Conn->GetTrack()->GetIsOwnedByPlatform())
+        {
+            Penalty += 2000.0; // Base penalty for length
+		}
+        //Conn->GetTrack()->IsOccupied();
         // Block & Signal inspection
         // 14. Block has Path reservation: +25
         // 15. Block occupied by Train: +SegmentLength * 2.0f
@@ -825,8 +1088,8 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
                 }
             }
 
-            UE_LOG(train_pathing, Verbose, TEXT("  %s Pt[%d] Conn=%p Owner=%s Track=%p TrackLen=%f ConnIndex=%d ForwardOffset=%f ReverseOffset=%f"),
-                *Tag, Index, C, OwnerName, T, TrackLength, ConnIndex, ForwardOffset, ReverseOffset);
+            /*UE_LOG(train_pathing, Verbose, TEXT("  %s Pt[%d] Conn=%p Owner=%s Track=%p TrackLen=%f ConnIndex=%d ForwardOffset=%f ReverseOffset=%f"),
+                *Tag, Index, C, OwnerName, T, TrackLength, ConnIndex, ForwardOffset, ReverseOffset);*/
         };
 
         if (Orig.Path.IsValid())
@@ -870,6 +1133,7 @@ void Ftrain_pathing_factoreworkModule::StartupModule()
                 if (self && self->IsLocalController())
                 {
                     UpdateInspectedTrackData(self, DeltaSeconds);
+                    UpdatePlayerTrainPathVisualization(self);
                 }
             });
 
@@ -894,6 +1158,16 @@ void Ftrain_pathing_factoreworkModule::StartupModule()
 
 void Ftrain_pathing_factoreworkModule::ShutdownModule()
 {
+#if ENABLE_TRACK_DEBUG_HUD
+    StopHighlightedTrainPath();
+    ClearTrackConnectionMarkers();
+
+    if (lastTrack)
+    {
+        lastTrack->StopBlockVisualization();
+        lastTrack = nullptr;
+    }
+#endif
 }
 
 #undef LOCTEXT_NAMESPACE
