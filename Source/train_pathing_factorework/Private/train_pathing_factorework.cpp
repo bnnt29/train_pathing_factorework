@@ -12,8 +12,343 @@
 #include "Buildables/FGBuildableTrainPlatform.h"
 #include "FGTrainPlatformConnection.h"
 #include "GraphAStar.h"
+#include "Buildables/FGBuildableTrainPlatformCargo.h"
+#include "Buildables/FGBuildableTrainPlatformEmpty.h"
+#include "FGFreightWagon.h"
 
 DEFINE_LOG_CATEGORY(train_pathing);
+
+static float CountVehiclesOnTrack(
+    AFGBuildableRailroadTrack* Track)
+{
+    float Counts = 0.0f;
+
+    if (!IsValid(Track))
+    {
+        return Counts;
+    }
+
+    for (const TObjectPtr<AFGRailroadVehicle>& Vehicle :
+        Track->GetVehicles())
+    {
+        AFGRailroadVehicle* VehicleActor = Vehicle.Get();
+
+        if (!IsValid(VehicleActor))
+        {
+            continue;
+        }
+        if (Cast<AFGLocomotive>(VehicleActor))
+        {
+            if (VehicleActor->IsOrientationReversed()) {
+                Counts += 1500.0f;
+            }
+            else {
+                Counts += 500.0f;
+            }
+
+            AFGTrain* Train = VehicleActor->GetTrain();
+
+            if (IsValid(Train))
+            {
+                if (Train->IsPlayerDriven())
+                {
+                    Counts += 3000.0f;
+                }
+
+                switch (Train->GetSelfDrivingError())
+                {
+                    case ESelfDrivingLocomotiveError::SDLE_NoTimeTable:
+                    case ESelfDrivingLocomotiveError::SDLE_InvalidNextStop:
+                    case ESelfDrivingLocomotiveError::SDLE_InvalidLocomotivePlacement:
+                    case ESelfDrivingLocomotiveError::SDLE_NoPath:
+                    case ESelfDrivingLocomotiveError::SDLE_StationUnreachable:
+                        Counts += 10000.0f;
+                        break;
+
+                    case ESelfDrivingLocomotiveError::SDLE_StationUnreachableWithSignals:
+                        Counts += 8000.0f;
+                        break;
+
+                    case ESelfDrivingLocomotiveError::SDLE_LongWaitAtSignal:
+                        Counts += 5000.0f;
+                        break;
+
+                    case ESelfDrivingLocomotiveError::SDLE_NoError:
+                    default:
+                        break;
+                }
+
+                switch (Train->GetDockingState())
+                {
+                    case ETrainDockingState::TDS_ReadyToDock:
+                        Counts += 1000.0f;
+                        break;
+
+                    case ETrainDockingState::TDS_Docked:
+                        Counts += 500.0f;
+                        break;
+
+                    case ETrainDockingState::TDS_None:
+                    default:
+                        break;
+                }
+            }
+            switch (VehicleActor->GetTrain()->GetSelfDrivingError()) {
+                case ESelfDrivingLocomotiveError::SDLE_NoTimeTable:
+                    Counts += 10000.0f;
+                    break;
+                case ESelfDrivingLocomotiveError::SDLE_InvalidNextStop:
+                    Counts += 10000.0f;
+                    break;
+                case ESelfDrivingLocomotiveError::SDLE_InvalidLocomotivePlacement:
+                    Counts += 10000.0f;
+                    break;
+                case ESelfDrivingLocomotiveError::SDLE_NoPath:
+                    Counts += 10000.0f;
+                    break;
+                case ESelfDrivingLocomotiveError::SDLE_StationUnreachable:
+                    Counts += 10000.0f;
+                    break;
+                case ESelfDrivingLocomotiveError::SDLE_StationUnreachableWithSignals:
+                    Counts += 8000.0f;
+                    break;
+                case ESelfDrivingLocomotiveError::SDLE_LongWaitAtSignal:
+                    Counts += 5000.0f;
+                    break;
+            }
+            switch (VehicleActor->GetTrain()->GetDockingState()) {
+            case ETrainDockingState::TDS_ReadyToDock:
+                Counts += 1000.0f;
+                break;
+            case ETrainDockingState::TDS_Docked:
+                Counts += 500.0f;
+                break;
+            }
+            //void GetDockingRuleSetForCurrentStop(FTrainDockingRuleSet& out_ruleSet) const;
+        }
+        else if (Cast<AFGFreightWagon>(VehicleActor))
+        {
+            Counts += 2000.0f;
+        }
+        if (VehicleActor->IsDocked()) {
+            Counts += 500.0f;
+        }
+        if (VehicleActor->IsDerailed()) {
+            Counts += 5000.0f;
+        }
+    }
+    return Counts;
+}
+
+static float CountStationPlatforms(
+    UFGRailroadTrackConnectionComponent* RailroadConnection)
+{
+    float Counts = 0.0f;
+
+    if (!IsValid(RailroadConnection))
+    {
+        return Counts;
+    }
+
+    AFGBuildableRailroadStation* Station =
+        RailroadConnection->GetStation();
+
+    if (!IsValid(Station))
+    {
+        return Counts;
+    }
+
+    Counts+=2000.0f;
+
+    UFGTrainPlatformConnection* CurrentConnection =
+        Station->GetStationOutputConnection();
+
+    TSet<UFGTrainPlatformConnection*> VisitedConnections;
+
+    while (CurrentConnection)
+    {
+        if (VisitedConnections.Contains(CurrentConnection))
+        {
+            break;
+        }
+
+        VisitedConnections.Add(CurrentConnection);
+
+        // Die aktuelle Verbindung zeigt auf die nächste Plattform.
+        UFGTrainPlatformConnection* ConnectedPlatformConnection =
+            CurrentConnection->GetConnectedTo();
+
+        if (!IsValid(ConnectedPlatformConnection))
+        {
+            break;
+        }
+
+        AFGBuildableTrainPlatform* Platform =
+            ConnectedPlatformConnection->GetPlatformOwner();
+
+        if (!IsValid(Platform))
+        {
+            break;
+        }
+
+        if (Cast<AFGBuildableTrainPlatformCargo>(Platform))
+        {
+            switch (Cast<AFGBuildableTrainPlatformCargo>(Platform)->GetDockingStatus()) {
+                case ETrainPlatformDockingStatus::ETPDS_WaitingToStart:
+                    Counts += 9000.0f;
+                    break;
+                case ETrainPlatformDockingStatus::ETPDS_Loading:
+                case ETrainPlatformDockingStatus::ETPDS_Unloading:
+                    Counts += 7000.0f;
+                    break;
+                case ETrainPlatformDockingStatus::ETPDS_WaitingForTransfer:
+                    Counts += 6000.0f;
+                    break;
+                case ETrainPlatformDockingStatus::ETPDS_Complete:
+                    Counts += 5000.0f;
+                    break;
+                case ETrainPlatformDockingStatus::ETPDS_WaitForTransferCondition:
+                    Counts += 4000.0f;
+                    break;
+                case ETrainPlatformDockingStatus::ETPDS_IdleWaitForTime:
+                    Counts += 3000.0f;
+                    break;
+                default:
+                    Counts += 2000.0f;
+					break;
+            }
+        }
+        else if (Cast<AFGBuildableTrainPlatformEmpty>(Platform))
+        {
+            Counts += 500.0f;
+        }
+        else {
+            Counts += 0.0f;
+        }
+
+        /*
+         * Eine Plattform besitzt zwei Verbindungen. Nachdem wir auf der
+         * Plattform angekommen sind, wechseln wir zur gegenüberliegenden
+         * Verbindung und folgen anschließend der nächsten Plattform.
+         */
+        UFGTrainPlatformConnection* OppositeConnection =
+            Platform->GetConnectionInOppositeDirection(
+                ConnectedPlatformConnection);
+
+        if (!IsValid(OppositeConnection))
+        {
+            break;
+        }
+
+        CurrentConnection = OppositeConnection;
+    }
+
+    return Counts;
+}
+
+struct FFactorioRailroadAStarFilter : public FRailroadGraphAStarFilter
+{
+    const FRailroadGraphAStarFilter& BaseFilter;
+
+    FFactorioRailroadAStarFilter(const FRailroadGraphAStarFilter& InBase)
+        : BaseFilter(InBase) {
+    }
+
+    float GetHeuristicScale() const {
+        return BaseFilter.GetHeuristicScale();
+    }
+
+    float GetHeuristicCost(const FRailroadGraphAStarPathPoint& StartNodeRef, const FRailroadGraphAStarPathPoint& EndNodeRef) const
+    {
+        float OrigCost = BaseFilter.GetHeuristicCost(StartNodeRef, EndNodeRef);
+
+        if (!IsValid(StartNodeRef.TrackConnection) || !IsValid(EndNodeRef.TrackConnection))
+        {
+            return 0.0f;
+        }
+        float NewCost = FVector::Dist(StartNodeRef.TrackConnection->GetComponentLocation(), EndNodeRef.TrackConnection->GetComponentLocation());
+        //UE_LOG(train_pathing, Verbose, TEXT("Heuristic = %f <=> %f"), OrigCost, NewCost);
+        return NewCost;
+    }
+
+    bool IsTraversalAllowed(const FRailroadGraphAStarPathPoint& NodeA, const FRailroadGraphAStarPathPoint& NodeB) const
+    {
+        bool bAllowed = BaseFilter.IsTraversalAllowed(NodeA, NodeB);
+        //UE_LOG(train_pathing, Verbose, TEXT("Orig_IsTraversal = %d"), bAllowed ? 1 : 0);
+
+        if (!IsValid(NodeA.TrackConnection) || !IsValid(NodeB.TrackConnection))
+        {
+            return false;
+        }
+
+        return bAllowed;
+    }
+
+    float CalculateFactorioPenalty(AFGBuildableRailroadTrack* Track) const
+    {
+        float Penalty = 0.0f;
+        if (!IsValid(Track)) {
+            return Penalty;
+        }
+        Penalty += CountStationPlatforms(Track->GetConnection(0)) + CountStationPlatforms(Track->GetConnection(1));
+        Penalty += CountVehiclesOnTrack(Track);
+        //Conn->GetTrack()->IsOccupied();
+        // Block & Signal inspection
+        // 14. Block has Path reservation: +25
+        // 15. Block occupied by Train: +SegmentLength * 2.0f
+        // 10. Train Long Waiting at Signal: +500
+        // 11. Train Waiting at Path Signal: +200
+
+        // Station penalties
+        // 7. Train Station: +2000 (+0.25 per platform)
+        // 4. Train Arriving at Station with Station as Destination: +2600
+        // 5. Train Station with Train: +2500
+
+        // Train State penalties (querying train occupying the block/station)
+        // 1. Manual Train without Player: +6750
+        // 2. Automatic Train without Schedule: +7000
+        // 3. Derailed Train: +5000
+        // 8. Manual Train with Player: +2000
+        // 9. Train without Path: +1400
+
+        return Penalty;
+    }
+
+    float GetTraversalCost(const FRailroadGraphAStarPathPoint& StartNodeRef, const FRailroadGraphAStarPathPoint& EndNodeRef) const
+    {
+        float OrigCost = BaseFilter.GetTraversalCost(StartNodeRef, EndNodeRef);
+
+        if (!IsValid(StartNodeRef.TrackConnection) || !IsValid(EndNodeRef.TrackConnection))
+        {
+            UE_LOG(train_pathing, Warning, TEXT("TraversalCost TrackConnection not valid (Start: %p, End: %p)"), StartNodeRef.TrackConnection, EndNodeRef.TrackConnection);
+            return 0.0f;
+        }
+
+        UFGRailroadTrackConnectionComponent* ConnB = EndNodeRef.TrackConnection;
+        AFGBuildableRailroadTrack* Track = ConnB ? ConnB->GetTrack() : nullptr;
+
+        if (!IsValid(Track) || Track != StartNodeRef.TrackConnection->GetTrack())
+        {
+            UE_LOG(train_pathing, Warning, TEXT("TraversalCost Tracks differ (Start: %p, End: %p)"), StartNodeRef.TrackConnection->GetTrack(), Track);
+            return 0.0f;
+		}
+
+        float SegmentLength = Track ? Track->GetLength() : 1000.0f;
+
+        // Base Cost (Rule 16: Length, slope, curvature adjustments)
+        float BaseCost = SegmentLength;
+
+        // Apply Factorio Penalty Table
+        float Penalty = CalculateFactorioPenalty(Track);
+        float NewCost = BaseCost + Penalty;
+        //UE_LOG(train_pathing, Verbose, TEXT("Traversal = %f <=> %f"), OrigCost, NewCost);
+        return NewCost;
+    }
+
+    bool WantsPartialSolution() const { return BaseFilter.WantsPartialSolution(); }
+    bool ShouldIncludeStartNodeInPath() const { return BaseFilter.ShouldIncludeStartNodeInPath(); }
+};
+
 
 // ---------------------------------------------------------------------------------
 // Debug HUD Configuration & Headers
@@ -79,7 +414,7 @@ static bool ContainsTrack(
 
 static AFGTrain* GetPlayerTrain(AFGPlayerController* PlayerController)
 {
-    if (!PlayerController)
+    if (!IsValid(PlayerController))
     {
         return nullptr;
     }
@@ -90,7 +425,7 @@ static AFGTrain* GetPlayerTrain(AFGPlayerController* PlayerController)
     AFGRailroadVehicle* RailroadVehicle =
         Cast<AFGRailroadVehicle>(PlayerPawn);
 
-    if (RailroadVehicle && RailroadVehicle->GetTrain())
+    if (IsValid(RailroadVehicle) && IsValid(RailroadVehicle->GetTrain()))
     {
         return RailroadVehicle->GetTrain();
     }
@@ -100,7 +435,7 @@ static AFGTrain* GetPlayerTrain(AFGPlayerController* PlayerController)
     AFGCharacterPlayer* Character =
         Cast<AFGCharacterPlayer>(PlayerPawn);
 
-    if (!Character || !PlayerController->GetWorld())
+    if (!IsValid(Character) || !IsValid(PlayerController->GetWorld()))
     {
         return nullptr;
     }
@@ -134,12 +469,12 @@ static void UpdatePlayerTrainPathVisualization(
      */
     AFGTrain* CurrentTrain = EnteredTrain;
 
-    if (!CurrentTrain)
+    if (!IsValid(CurrentTrain))
     {
         CurrentTrain = GHighlightedTrain.Get();
     }
 
-    if (!CurrentTrain)
+    if (!IsValid(CurrentTrain))
     {
         if (GHighlightedPathTracks.Num() > 0)
         {
@@ -188,7 +523,7 @@ static void UpdatePlayerTrainPathVisualization(
         UFGRailroadTrackConnectionComponent* Connection =
             CurrentPath->PathPoints[PathPointIndex].TrackConnection.Get();
 
-        if (!Connection)
+        if (!IsValid(Connection))
         {
             UE_LOG(
                 train_pathing,
@@ -206,7 +541,7 @@ static void UpdatePlayerTrainPathVisualization(
         AFGBuildableRailroadTrack* Track =
             Connection->GetTrack();
 
-        if (!Track)
+        if (!IsValid(Track))
         {
             UE_LOG(
                 train_pathing,
@@ -304,7 +639,7 @@ static void ClearTrackConnectionMarkers()
 static FVector GetTrackConnectionMarkerLocation(
     UFGRailroadTrackConnectionComponent* Connection)
 {
-    if (!Connection)
+    if (!IsValid(Connection))
     {
         return FVector::ZeroVector;
     }
@@ -320,7 +655,7 @@ static AActor* CreateTrackConnectionMarker(
     UFGRailroadTrackConnectionComponent* Connection,
     const FLinearColor& Color)
 {
-    if (!World || !Connection)
+    if (!IsValid(World) || !IsValid(Connection))
     {
         return nullptr;
     }
@@ -336,7 +671,7 @@ static AActor* CreateTrackConnectionMarker(
         SpawnParameters
     );
 
-    if (!MarkerActor)
+    if (!IsValid(MarkerActor))
     {
         return nullptr;
     }
@@ -344,7 +679,7 @@ static AActor* CreateTrackConnectionMarker(
     UStaticMeshComponent* MarkerMesh =
         NewObject<UStaticMeshComponent>(MarkerActor);
 
-    if (!MarkerMesh)
+    if (!IsValid(MarkerMesh))
     {
         MarkerActor->Destroy();
         return nullptr;
@@ -358,7 +693,7 @@ static AActor* CreateTrackConnectionMarker(
         TEXT("/Engine/BasicShapes/Sphere.Sphere")
     );
 
-    if (!SphereMesh)
+    if (!IsValid(SphereMesh))
     {
         UE_LOG(
             train_pathing,
@@ -408,7 +743,7 @@ static void UpdateTrackConnectionMarkers(
     UWorld* World,
     AFGBuildableRailroadTrack* Track)
 {
-    if (!World || !Track)
+    if (!IsValid(World) || !IsValid(Track))
     {
         ClearTrackConnectionMarkers();
         return;
@@ -452,7 +787,7 @@ static void UpdateTrackConnectionMarkers(
         UFGRailroadTrackConnectionComponent* Connection =
             Track->GetConnection(ConnectionIndex);
 
-        if (!Connection)
+        if (!IsValid(Connection))
         {
             UE_LOG(
                 train_pathing,
@@ -485,7 +820,7 @@ static void UpdateTrackConnectionMarkers(
 // 1. Raycast helper to find the track under the crosshair
 static AFGBuildableRailroadTrack* GetLookedAtRailTrack(UWorld* World, APlayerController* PC)
 {
-    if (!World || !PC || !PC->PlayerCameraManager) return nullptr;
+    if (!IsValid(World) || !IsValid(PC) || !IsValid(PC->PlayerCameraManager)) return nullptr;
 
     FVector CamLoc = PC->PlayerCameraManager->GetCameraLocation();
     FVector CamForward = PC->PlayerCameraManager->GetCameraRotation().Vector();
@@ -506,7 +841,7 @@ static AFGBuildableRailroadTrack* GetLookedAtRailTrack(UWorld* World, APlayerCon
 // 2. Periodic trace update called from PlayerTick
 static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSeconds)
 {
-    if (!FGPC) return;
+    if (!IsValid(FGPC)) return;
 
     GTrackTraceTimer += DeltaSeconds;
     if (GTrackTraceTimer < TRACE_INTERVAL)
@@ -515,20 +850,71 @@ static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSecon
     }
     GTrackTraceTimer = 0.0f;
     AFGBuildableRailroadTrack* nTrack = GetLookedAtRailTrack(FGPC->GetWorld(), FGPC);
-    if (nTrack)
+    if (IsValid(nTrack))
     {
         UpdateTrackConnectionMarkers(FGPC->GetWorld(), nTrack);
+
+        UFGRailroadTrackConnectionComponent* BeginningConnection =
+            nTrack->GetConnection(0);
+
+        UFGRailroadTrackConnectionComponent* EndConnection =
+            nTrack->GetConnection(1);
+
+        if (!IsValid(BeginningConnection) || !IsValid(EndConnection))
+        {
+            GInspectedTrackText = FString::Printf(
+                TEXT(
+                    "Looking at Track: %s | Ptr: %p\n"
+                    "Length: %f\n"
+                    "Track connections are not initialized yet."
+                ),
+                *nTrack->GetName(),
+                nTrack,
+                nTrack->GetLength()
+            );
+
+            return;
+        }
+
+        FRailroadGraphAStarFilter origFilter;
+        FFactorioRailroadAStarFilter filter(origFilter);
 
         GInspectedTrackText = FString::Printf(
             TEXT(
                 "Looking at Track: %s | Ptr: %p\n"
+                "Length: %f\n"
                 "Beginning [0]: %p\n"
-                "End [1]: %p"
+                "End [1]: %p\n"
+                "Heuristics: %f\n"
+                "Traversal: %f\n"
+                "IsTraversalAllowed: %d\n"
+                "Rev Heuristics: %f\n"
+                "Rev Traversal: %f\n"
+                "Rev IsTraversalAllowed: %d\n"
             ),
             *nTrack->GetName(),
             nTrack,
-            nTrack->GetConnection(0),
-            nTrack->GetConnection(1)
+            nTrack->GetLength(),
+            BeginningConnection,
+            EndConnection,
+            filter.GetHeuristicCost(
+                FRailroadGraphAStarPathPoint(BeginningConnection),
+                FRailroadGraphAStarPathPoint(EndConnection)),
+            filter.GetTraversalCost(
+                FRailroadGraphAStarPathPoint(BeginningConnection),
+                FRailroadGraphAStarPathPoint(EndConnection)),
+            filter.IsTraversalAllowed(
+                FRailroadGraphAStarPathPoint(BeginningConnection),
+                FRailroadGraphAStarPathPoint(EndConnection)) ? 1 : 0,
+            filter.GetHeuristicCost(
+                FRailroadGraphAStarPathPoint(EndConnection),
+                FRailroadGraphAStarPathPoint(BeginningConnection)),
+            filter.GetTraversalCost(
+                FRailroadGraphAStarPathPoint(EndConnection),
+                FRailroadGraphAStarPathPoint(BeginningConnection)),
+            filter.IsTraversalAllowed(
+                FRailroadGraphAStarPathPoint(EndConnection),
+                FRailroadGraphAStarPathPoint(BeginningConnection)) ? 1 : 0
         );
 
         // Bestehende Blockvisualisierung beibehalten.
@@ -568,7 +954,7 @@ static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSecon
 }
 static void DrawTrackHUD_Canvas(AHUD* HUD)
 {
-    if (!HUD) return;
+    if (!IsValid(HUD)) return;
 
     UFont* Font = GEngine ? GEngine->GetSmallFont() : nullptr;
     if (!Font) return;
@@ -601,100 +987,6 @@ static void DrawTrackHUD_Canvas(AHUD* HUD)
 
 #endif
 
-struct FFactorioRailroadAStarFilter : public FRailroadGraphAStarFilter
-{
-    const FRailroadGraphAStarFilter& BaseFilter;
-
-    FFactorioRailroadAStarFilter(const FRailroadGraphAStarFilter& InBase)
-        : BaseFilter(InBase) {
-    }
-
-    float GetHeuristicScale() const {
-        return BaseFilter.GetHeuristicScale();
-    }
-
-    float GetHeuristicCost(const FRailroadGraphAStarPathPoint& StartNodeRef, const FRailroadGraphAStarPathPoint& EndNodeRef) const
-    {
-        float OrigCost = BaseFilter.GetHeuristicCost(StartNodeRef, EndNodeRef);
-
-        if (!StartNodeRef.TrackConnection || !EndNodeRef.TrackConnection)
-        {
-            return 0.0f;
-        }
-        float NewCost = FVector::Dist(StartNodeRef.TrackConnection->GetComponentLocation(), EndNodeRef.TrackConnection->GetComponentLocation());
-        UE_LOG(train_pathing, Verbose, TEXT("Heuristic = %f <=> %f"), OrigCost, NewCost);
-        return NewCost;
-    }
-
-    bool IsTraversalAllowed(const FRailroadGraphAStarPathPoint& NodeA, const FRailroadGraphAStarPathPoint& NodeB) const
-    {
-        bool bAllowed = BaseFilter.IsTraversalAllowed(NodeA, NodeB);
-        //UE_LOG(train_pathing, Verbose, TEXT("Orig_IsTraversal = %d"), bAllowed ? 1 : 0);
-
-        if (!NodeA.TrackConnection || !NodeB.TrackConnection)
-        {
-            return false;
-        }
-
-        return bAllowed;
-    }
-
-    float CalculateFactorioPenalty(UFGRailroadTrackConnectionComponent* Conn, float SegmentLength) const
-    {
-        float Penalty = 0.0f;
-        if (Conn && Conn->GetTrack() && Conn->GetTrack()->GetIsOwnedByPlatform())
-        {
-            Penalty += 2000.0; // Base penalty for length
-		}
-        //Conn->GetTrack()->IsOccupied();
-        // Block & Signal inspection
-        // 14. Block has Path reservation: +25
-        // 15. Block occupied by Train: +SegmentLength * 2.0f
-        // 10. Train Long Waiting at Signal: +500
-        // 11. Train Waiting at Path Signal: +200
-
-        // Station penalties
-        // 7. Train Station: +2000 (+0.25 per platform)
-        // 4. Train Arriving at Station with Station as Destination: +2600
-        // 5. Train Station with Train: +2500
-
-        // Train State penalties (querying train occupying the block/station)
-        // 1. Manual Train without Player: +6750
-        // 2. Automatic Train without Schedule: +7000
-        // 3. Derailed Train: +5000
-        // 8. Manual Train with Player: +2000
-        // 9. Train without Path: +1400
-
-        return Penalty;
-    }
-
-    float GetTraversalCost(const FRailroadGraphAStarPathPoint& StartNodeRef, const FRailroadGraphAStarPathPoint& EndNodeRef) const
-    {
-        float OrigCost = BaseFilter.GetTraversalCost(StartNodeRef, EndNodeRef);
-
-        if (!StartNodeRef.TrackConnection || !EndNodeRef.TrackConnection)
-        {
-            return 0.0f;
-        }
-
-        UFGRailroadTrackConnectionComponent* ConnB = EndNodeRef.TrackConnection;
-        AFGBuildableRailroadTrack* Track = ConnB ? ConnB->GetTrack() : nullptr;
-        float SegmentLength = Track ? Track->GetLength() : 1000.0f;
-
-        // Base Cost (Rule 16: Length, slope, curvature adjustments)
-        float BaseCost = SegmentLength;
-
-        // Apply Factorio Penalty Table
-        float Penalty = CalculateFactorioPenalty(ConnB, SegmentLength);
-        float NewCost = BaseCost + Penalty;
-        UE_LOG(train_pathing, Verbose, TEXT("Traversal = %f <=> %f"), OrigCost, NewCost);
-        return NewCost;
-    }
-
-    bool WantsPartialSolution() const { return BaseFilter.WantsPartialSolution(); }
-    bool ShouldIncludeStartNodeInPath() const { return BaseFilter.ShouldIncludeStartNodeInPath(); }
-};
-
 
 void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     AFGBuildableRailroadStation* station,
@@ -704,7 +996,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     Result.Locomotive = locomotive;
     Result.Result = ERailroadPathFindingResult::RPFR_Error;
 
-    if (!locomotive || !station)
+    if (!IsValid(locomotive) || !IsValid(station))
     {
         UE_LOG(train_pathing, Verbose, TEXT("FindPathSyncHook: locomotive or station invalid (locomotive=%p, station=%p)"), locomotive, station);
         scope.Override(Result);
@@ -787,7 +1079,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         }
     }
 
-    if (!GoalConn)
+    if (!IsValid(GoalConn))
     {
         StationForwardConn = station->GetTrackPosition().GetForwardConnection();
         StationReverseConn = station->GetTrackPosition().GetReverseConnection();
@@ -817,7 +1109,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         );
     }
 
-    if (!StartConn || !GoalConn)
+    if (!IsValid(StartConn) || !IsValid(GoalConn))
     {
         UE_LOG(train_pathing, Verbose, TEXT("locomotive or station connection invalid (StartConn=%p, GoalConn=%p)"), StartConn, GoalConn);
         Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
@@ -865,7 +1157,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
 
     for (const FRailroadGraphAStarPathPoint& Pt : OutPathPoints)
     {
-        if (!Pt.TrackConnection) continue;
+        if (!IsValid(Pt.TrackConnection)) continue;
         UFGRailroadTrackConnectionComponent* Conn = Pt.TrackConnection;
         if (NormalizedConns.Num() == 0 || NormalizedConns.Last() != Conn)
         {
@@ -1060,7 +1352,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         // Erweiterte Details beim Path-Vergleich
         auto LogDetailedPoint = [](UFGRailroadTrackConnectionComponent* C, const FString& Tag, int32 Index)
         {
-            if (!C)
+            if (!IsValid(C))
             {
                 UE_LOG(train_pathing, Verbose, TEXT("  %s Pt[%d] Conn=null"), *Tag, Index);
                 return;
@@ -1165,8 +1457,15 @@ void Ftrain_pathing_factoreworkModule::ShutdownModule()
     if (lastTrack)
     {
         lastTrack->StopBlockVisualization();
-        lastTrack = nullptr;
     }
+    lastTrack = nullptr;
+    GInspectedTrackText = TEXT("Looking at Track: [None]");
+    GTrackTraceTimer = 0.0f;
+    GConnectionMarkerActors.Empty();
+    GMarkerTrack = nullptr;
+    GHighlightedTrain = nullptr;
+    GHighlightedPath = nullptr;
+    GHighlightedPathTracks.Empty();
 #endif
 }
 
