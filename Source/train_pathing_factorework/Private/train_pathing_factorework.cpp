@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "train_pathing_factorework.h"
+#include "BP_TrainPathingFactoreworkConfigStruct.h"
 
 #include "Patching/NativeHookManager.h"
 
@@ -19,7 +20,8 @@
 DEFINE_LOG_CATEGORY(train_pathing);
 
 static float CountVehiclesOnTrack(
-    AFGBuildableRailroadTrack* Track)
+    AFGBuildableRailroadTrack* Track,
+    const FBP_TrainPathingFactoreworkConfigStruct& Config)
 {
     float Counts = 0.0f;
 
@@ -37,40 +39,55 @@ static float CountVehiclesOnTrack(
         {
             continue;
         }
-        if (Cast<AFGLocomotive>(VehicleActor))
+        if (AFGLocomotive* Locomotive =
+            Cast<AFGLocomotive>(VehicleActor))
         {
-            if (VehicleActor->IsOrientationReversed()) {
-                Counts += 1500.0f;
+            if (Locomotive->IsOrientationReversed())
+            {
+                Counts += Config.Trains.LocomotiveReversedPenalty;
             }
-            else {
-                Counts += 500.0f;
+            else
+            {
+                Counts += Config.Trains.LocomotiveForwardPenalty;
             }
 
-            AFGTrain* Train = VehicleActor->GetTrain();
+            AFGTrain* Train = Locomotive->GetTrain();
 
             if (IsValid(Train))
             {
                 if (Train->IsPlayerDriven())
                 {
-                    Counts += 3000.0f;
+                    Counts += Config.Trains.PlayerDrivenTrainPenalty;
                 }
 
                 switch (Train->GetSelfDrivingError())
                 {
                     case ESelfDrivingLocomotiveError::SDLE_NoTimeTable:
+                        Counts += Config.Trains.SelfDriving.NoTimeTablePenalty;
+                        break;
+
                     case ESelfDrivingLocomotiveError::SDLE_InvalidNextStop:
+                        Counts += Config.Trains.SelfDriving.InvalidNextStopPenalty;
+                        break;
+
                     case ESelfDrivingLocomotiveError::SDLE_InvalidLocomotivePlacement:
+                        Counts += Config.Trains.SelfDriving.InvalidLocomotivePenalty;
+                        break;
+
                     case ESelfDrivingLocomotiveError::SDLE_NoPath:
+                        Counts += Config.Trains.SelfDriving.NoPathPenalty;
+                        break;
+
                     case ESelfDrivingLocomotiveError::SDLE_StationUnreachable:
-                        Counts += 10000.0f;
+                        Counts += Config.Trains.SelfDriving.StationUnreachablePenalty;
                         break;
 
                     case ESelfDrivingLocomotiveError::SDLE_StationUnreachableWithSignals:
-                        Counts += 8000.0f;
+                        Counts += Config.Trains.SelfDriving.SignalUnreachablePenalty;
                         break;
 
                     case ESelfDrivingLocomotiveError::SDLE_LongWaitAtSignal:
-                        Counts += 5000.0f;
+                        Counts += Config.Trains.SelfDriving.LongWaitPenalty;
                         break;
 
                     case ESelfDrivingLocomotiveError::SDLE_NoError:
@@ -81,11 +98,11 @@ static float CountVehiclesOnTrack(
                 switch (Train->GetDockingState())
                 {
                     case ETrainDockingState::TDS_ReadyToDock:
-                        Counts += 1000.0f;
+                        Counts += Config.Platforms.Docking.ReadyPenalty;
                         break;
 
                     case ETrainDockingState::TDS_Docked:
-                        Counts += 500.0f;
+                        Counts += Config.Platforms.Docking.CompletePenalty;
                         break;
 
                     case ETrainDockingState::TDS_None:
@@ -93,55 +110,28 @@ static float CountVehiclesOnTrack(
                         break;
                 }
             }
-            switch (VehicleActor->GetTrain()->GetSelfDrivingError()) {
-                case ESelfDrivingLocomotiveError::SDLE_NoTimeTable:
-                    Counts += 10000.0f;
-                    break;
-                case ESelfDrivingLocomotiveError::SDLE_InvalidNextStop:
-                    Counts += 10000.0f;
-                    break;
-                case ESelfDrivingLocomotiveError::SDLE_InvalidLocomotivePlacement:
-                    Counts += 10000.0f;
-                    break;
-                case ESelfDrivingLocomotiveError::SDLE_NoPath:
-                    Counts += 10000.0f;
-                    break;
-                case ESelfDrivingLocomotiveError::SDLE_StationUnreachable:
-                    Counts += 10000.0f;
-                    break;
-                case ESelfDrivingLocomotiveError::SDLE_StationUnreachableWithSignals:
-                    Counts += 8000.0f;
-                    break;
-                case ESelfDrivingLocomotiveError::SDLE_LongWaitAtSignal:
-                    Counts += 5000.0f;
-                    break;
-            }
-            switch (VehicleActor->GetTrain()->GetDockingState()) {
-            case ETrainDockingState::TDS_ReadyToDock:
-                Counts += 1000.0f;
-                break;
-            case ETrainDockingState::TDS_Docked:
-                Counts += 500.0f;
-                break;
-            }
-            //void GetDockingRuleSetForCurrentStop(FTrainDockingRuleSet& out_ruleSet) const;
         }
         else if (Cast<AFGFreightWagon>(VehicleActor))
         {
-            Counts += 2000.0f;
+            Counts += Config.Trains.FreightWagonPenalty;
         }
-        if (VehicleActor->IsDocked()) {
-            Counts += 500.0f;
+
+        if (VehicleActor->IsDocked())
+        {
+            Counts += Config.Trains.DockedVehiclePenalty;
         }
-        if (VehicleActor->IsDerailed()) {
-            Counts += 5000.0f;
+
+        if (VehicleActor->IsDerailed())
+        {
+            Counts += Config.Trains.DerailedVehiclePenalty;
         }
     }
     return Counts;
 }
 
 static float CountStationPlatforms(
-    UFGRailroadTrackConnectionComponent* RailroadConnection)
+    UFGRailroadTrackConnectionComponent* RailroadConnection,
+    const FBP_TrainPathingFactoreworkConfigStruct& Config)
 {
     float Counts = 0.0f;
 
@@ -158,10 +148,15 @@ static float CountStationPlatforms(
         return Counts;
     }
 
-    Counts+=2000.0f;
+    Counts+= Config.Platforms.StationBasePenalty;
 
     UFGTrainPlatformConnection* CurrentConnection =
         Station->GetStationOutputConnection();
+
+    if (!IsValid(CurrentConnection))
+    {
+        return Counts;
+    }
 
     TSet<UFGTrainPlatformConnection*> VisitedConnections;
 
@@ -195,32 +190,38 @@ static float CountStationPlatforms(
         {
             switch (Cast<AFGBuildableTrainPlatformCargo>(Platform)->GetDockingStatus()) {
                 case ETrainPlatformDockingStatus::ETPDS_WaitingToStart:
-                    Counts += 9000.0f;
+                    Counts += Config.Platforms.CargoPlatform.WaitingPenalty;
                     break;
+
                 case ETrainPlatformDockingStatus::ETPDS_Loading:
                 case ETrainPlatformDockingStatus::ETPDS_Unloading:
-                    Counts += 7000.0f;
+                    Counts += Config.Platforms.CargoPlatform.LoadingPenalty;
                     break;
+
                 case ETrainPlatformDockingStatus::ETPDS_WaitingForTransfer:
-                    Counts += 6000.0f;
+                    Counts += Config.Platforms.CargoPlatform.TransferPenalty;
                     break;
+
                 case ETrainPlatformDockingStatus::ETPDS_Complete:
-                    Counts += 5000.0f;
+                    Counts += Config.Platforms.CargoPlatform.CompletePenalty;
                     break;
+
                 case ETrainPlatformDockingStatus::ETPDS_WaitForTransferCondition:
-                    Counts += 4000.0f;
+                    Counts += Config.Platforms.CargoPlatform.ConditionPenalty;
                     break;
+
                 case ETrainPlatformDockingStatus::ETPDS_IdleWaitForTime:
-                    Counts += 3000.0f;
+                    Counts += Config.Platforms.CargoPlatform.IdlePenalty;
                     break;
+
+                case ETrainPlatformDockingStatus::ETPDS_None:
                 default:
-                    Counts += 2000.0f;
-					break;
+                    break;
             }
         }
         else if (Cast<AFGBuildableTrainPlatformEmpty>(Platform))
         {
-            Counts += 500.0f;
+            Counts += Config.Platforms.EmptyPlatformPenalty;
         }
         else {
             Counts += 0.0f;
@@ -246,12 +247,18 @@ static float CountStationPlatforms(
     return Counts;
 }
 
-struct FFactorioRailroadAStarFilter : public FRailroadGraphAStarFilter
+struct FFactorioRailroadAStarFilter :
+    public FRailroadGraphAStarFilter
 {
     const FRailroadGraphAStarFilter& BaseFilter;
+    FBP_TrainPathingFactoreworkConfigStruct Config;
 
-    FFactorioRailroadAStarFilter(const FRailroadGraphAStarFilter& InBase)
-        : BaseFilter(InBase) {
+    FFactorioRailroadAStarFilter(
+        const FRailroadGraphAStarFilter& InBase,
+        const FBP_TrainPathingFactoreworkConfigStruct& InConfig)
+        : BaseFilter(InBase)
+        , Config(InConfig)
+    {
     }
 
     float GetHeuristicScale() const {
@@ -290,8 +297,8 @@ struct FFactorioRailroadAStarFilter : public FRailroadGraphAStarFilter
         if (!IsValid(Track)) {
             return Penalty;
         }
-        Penalty += CountStationPlatforms(Track->GetConnection(0)) + CountStationPlatforms(Track->GetConnection(1));
-        Penalty += CountVehiclesOnTrack(Track);
+        Penalty += CountStationPlatforms(Track->GetConnection(0), Config) + CountStationPlatforms(Track->GetConnection(1), Config);
+        Penalty += CountVehiclesOnTrack(Track, Config);
         //Conn->GetTrack()->IsOccupied();
         // Block & Signal inspection
         // 14. Block has Path reservation: +25
@@ -839,9 +846,24 @@ static AFGBuildableRailroadTrack* GetLookedAtRailTrack(UWorld* World, APlayerCon
 }
 
 // 2. Periodic trace update called from PlayerTick
-static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSeconds)
+static void UpdateInspectedTrackData(
+    AFGPlayerController* FGPC,
+    float DeltaSeconds)
 {
-    if (!IsValid(FGPC)) return;
+    if (!IsValid(FGPC))
+    {
+        return;
+    }
+
+    const FBP_TrainPathingFactoreworkConfigStruct Config =
+        FBP_TrainPathingFactoreworkConfigStruct::GetActiveConfig(FGPC);
+
+    if (!Config.Debug.EnableDebugHud)
+    {
+        ClearTrackConnectionMarkers();
+        GInspectedTrackText = TEXT("Track debug HUD disabled");
+        return;
+    }
 
     GTrackTraceTimer += DeltaSeconds;
     if (GTrackTraceTimer < TRACE_INTERVAL)
@@ -877,7 +899,7 @@ static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSecon
         }
 
         FRailroadGraphAStarFilter origFilter;
-        FFactorioRailroadAStarFilter filter(origFilter);
+        FFactorioRailroadAStarFilter Filter(origFilter, Config);
 
         GInspectedTrackText = FString::Printf(
             TEXT(
@@ -897,22 +919,22 @@ static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSecon
             nTrack->GetLength(),
             BeginningConnection,
             EndConnection,
-            filter.GetHeuristicCost(
+            Filter.GetHeuristicCost(
                 FRailroadGraphAStarPathPoint(BeginningConnection),
                 FRailroadGraphAStarPathPoint(EndConnection)),
-            filter.GetTraversalCost(
+            Filter.GetTraversalCost(
                 FRailroadGraphAStarPathPoint(BeginningConnection),
                 FRailroadGraphAStarPathPoint(EndConnection)),
-            filter.IsTraversalAllowed(
+            Filter.IsTraversalAllowed(
                 FRailroadGraphAStarPathPoint(BeginningConnection),
                 FRailroadGraphAStarPathPoint(EndConnection)) ? 1 : 0,
-            filter.GetHeuristicCost(
+            Filter.GetHeuristicCost(
                 FRailroadGraphAStarPathPoint(EndConnection),
                 FRailroadGraphAStarPathPoint(BeginningConnection)),
-            filter.GetTraversalCost(
+            Filter.GetTraversalCost(
                 FRailroadGraphAStarPathPoint(EndConnection),
                 FRailroadGraphAStarPathPoint(BeginningConnection)),
-            filter.IsTraversalAllowed(
+            Filter.IsTraversalAllowed(
                 FRailroadGraphAStarPathPoint(EndConnection),
                 FRailroadGraphAStarPathPoint(BeginningConnection)) ? 1 : 0
         );
@@ -954,7 +976,19 @@ static void UpdateInspectedTrackData(AFGPlayerController* FGPC, float DeltaSecon
 }
 static void DrawTrackHUD_Canvas(AHUD* HUD)
 {
-    if (!IsValid(HUD)) return;
+    if (!IsValid(HUD))
+    {
+        return;
+    }
+
+    const FBP_TrainPathingFactoreworkConfigStruct Config =
+        FBP_TrainPathingFactoreworkConfigStruct::GetActiveConfig(HUD);
+
+    if (!Config.Debug.EnableDebugHud)
+    {
+        return;
+    }
+
 
     UFont* Font = GEngine ? GEngine->GetSmallFont() : nullptr;
     if (!Font) return;
@@ -1126,7 +1160,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
 
     // 3. Run Custom A* with Factorio Cost Filter
     FRailroadGraphAStarHelper GraphHelper;
-    FFactorioRailroadAStarFilter CustomFilter(filter);
+    FFactorioRailroadAStarFilter CustomFilter(filter, FBP_TrainPathingFactoreworkConfigStruct::GetActiveConfig(locomotive));
     FGraphAStar<FRailroadGraphAStarHelper> AStarSolver(GraphHelper);
 
     TArray<FRailroadGraphAStarPathPoint> OutPathPoints;
@@ -1422,7 +1456,9 @@ void Ftrain_pathing_factoreworkModule::StartupModule()
         SUBSCRIBE_METHOD_VIRTUAL(AFGPlayerController::PlayerTick, PCDefault, [](auto& scope, AFGPlayerController* self, float DeltaSeconds)
             {
                 scope(self, DeltaSeconds);
-                if (self && self->IsLocalController())
+                if (self &&
+                    self->IsLocalController() &&
+                    FBP_TrainPathingFactoreworkConfigStruct::GetActiveConfig(self).Debug.EnableDebugHud)
                 {
                     UpdateInspectedTrackData(self, DeltaSeconds);
                     UpdatePlayerTrainPathVisualization(self);
