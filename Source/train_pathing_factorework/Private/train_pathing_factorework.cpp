@@ -338,9 +338,9 @@ float FFactorioRailroadAStarFilter::GetTraversalCost(
     UFGRailroadTrackConnectionComponent* ConnB = EndNodeRef.TrackConnection;
     AFGBuildableRailroadTrack* Track = ConnB ? ConnB->GetTrack() : nullptr;
 
-    if (!IsValid(Track) || Track != StartNodeRef.TrackConnection->GetTrack())
+    if (!IsValid(Track))
     {
-        UE_LOG(train_pathing, Warning, TEXT("TraversalCost Tracks differ (Start: %p, End: %p)"), StartNodeRef.TrackConnection->GetTrack(), Track);
+        UE_LOG(train_pathing, Warning, TEXT("TraversalCost Tracks invalid (Start: %p, End: %p)"), StartNodeRef.TrackConnection->GetTrack(), Track);
         return 0.0f;
     }
 
@@ -351,7 +351,7 @@ float FFactorioRailroadAStarFilter::GetTraversalCost(
 
     // Apply Factorio Penalty Table
     float Penalty = CalculateFactorioPenalty(Track);
-    float NewCost = BaseCost + Penalty;
+    float NewCost = BaseCost + Penalty * Config.Other.BasePenaltyScale;
     //UE_LOG(train_pathing, Verbose, TEXT("Traversal = %f <=> %f"), OrigCost, NewCost);
     return NewCost;
 }
@@ -382,6 +382,11 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     AFGBuildableRailroadStation* station,
     FRailroadGraphAStarFilter filter)
 {
+    if (FTrainPathingConfigStruct::GetActiveConfig(locomotive).Debug.UseOriginalPathFinding) {
+        scope.Override(scope(locomotive, station, filter));
+        UE_LOG(train_pathing, Verbose, TEXT("Used Original Pathfinding"));
+        return;
+    }
     FRailroadPathFindingResult Result;
     Result.Locomotive = locomotive;
     Result.Result = ERailroadPathFindingResult::RPFR_Error;

@@ -82,6 +82,9 @@ public:
 
     UPROPERTY(BlueprintReadWrite)
     bool EnableVerboseLogging{};
+
+    UPROPERTY(BlueprintReadWrite)
+    bool UseOriginalPathFinding{};
 };
 
 USTRUCT(BlueprintType)
@@ -137,6 +140,8 @@ USTRUCT(BlueprintType)
 struct FTrainPathingConfigStruct_Other {
     GENERATED_BODY()
 public:
+    UPROPERTY(BlueprintReadWrite)
+    float BasePenaltyScale{};
 };
 
 /* Struct generated from Mod Configuration Asset '/train_pathing_factorework/TrainPathingConfig' */
