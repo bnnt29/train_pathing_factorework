@@ -9,6 +9,7 @@
 #include "GraphAStar.h"
 #include "RailroadNavigation.h"
 #include "TrainPathingConfigStruct.h"
+#include "FGTrain.h"
 
 class AFGBuildableRailroadTrack;
 
@@ -16,7 +17,8 @@ DECLARE_LOG_CATEGORY_EXTERN(train_pathing, Verbose, All);
 
 TRAIN_PATHING_FACTOREWORK_API float CountVehiclesOnTrack(
     AFGBuildableRailroadTrack* Track,
-    const FTrainPathingConfigStruct& Config);
+    const FTrainPathingConfigStruct& Config,
+    const AFGTrain* IgnoredTrain = nullptr);
 
 TRAIN_PATHING_FACTOREWORK_API float CountStationPlatforms(
     UFGRailroadTrackConnectionComponent* RailroadConnection,
@@ -44,14 +46,16 @@ struct TRAIN_PATHING_FACTOREWORK_API FFactorioRailroadAStarFilter :
 
     float GetTraversalCost(
         const FRailroadGraphAStarPathPoint& StartNodeRef,
-        const FRailroadGraphAStarPathPoint& EndNodeRef) const;
+        const FRailroadGraphAStarPathPoint& EndNodeRef,
+        const AFGTrain* IgnoredTrain = nullptr) const;
 
     bool WantsPartialSolution() const;
     bool ShouldIncludeStartNodeInPath() const;
 
 private:
     float CalculateFactorioPenalty(
-        AFGBuildableRailroadTrack* Track) const;
+        AFGBuildableRailroadTrack* Track,
+        const AFGTrain* IgnoredTrain = nullptr) const;
 };
 
 class Ftrain_pathing_factoreworkModule : public IModuleInterface

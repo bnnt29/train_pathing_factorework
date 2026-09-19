@@ -42,6 +42,88 @@ namespace
     static TWeakObjectPtr<AFGTrain> GHighlightedTrain;
     static FRailroadPathSharedPtr GHighlightedPath;
     static TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>> GHighlightedPathTracks;
+    static TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>>
+        GManuallySelectedTracks;
+
+    static float GManualSelectionAccumulatedPenalty = 0.0f;
+    static float GManualSelectionAccumulatedPenaltyTrain = 0.0f;
+    static float GManualSelectionMinimumPenalty = 0.0f;
+    static float GManualSelectionMaximumPenalty = 0.0f;
+    static TWeakObjectPtr<AFGTrain> GLastEnteredManualTrain;
+
+    static bool ContainsTrack(
+        const TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>>& Tracks,
+        AFGBuildableRailroadTrack* Track);
+
+    static bool IsManuallySelectedTrack(
+        AFGBuildableRailroadTrack* Track)
+    {
+        if (!IsValid(Track))
+        {
+            return false;
+        }
+
+        return ContainsTrack(GManuallySelectedTracks, Track);
+    }
+
+    static bool IsTrainPathTrack(
+        AFGBuildableRailroadTrack* Track)
+    {
+        if (!IsValid(Track))
+        {
+            return false;
+        }
+
+        return ContainsTrack(GHighlightedPathTracks, Track);
+    }
+
+    static void StopTrackVisualizationIfUnused(
+        AFGBuildableRailroadTrack* Track)
+    {
+        if (!IsValid(Track))
+        {
+            return;
+        }
+
+        if (Track == lastTrack ||
+            IsManuallySelectedTrack(Track) ||
+            IsTrainPathTrack(Track))
+        {
+            return;
+        }
+
+        Track->StopBlockVisualization();
+    }
+
+    static void ClearManualTrackSelection()
+    {
+        for (TWeakObjectPtr<AFGBuildableRailroadTrack>& Track :
+            GManuallySelectedTracks)
+        {
+            if (Track.IsValid())
+            {
+                AFGBuildableRailroadTrack* TrackActor = Track.Get();
+
+                /*
+                 * Der Track kann gleichzeitig Teil des berechneten Pfades
+                 * oder der Viewport-Auswahl sein.
+                 */
+                if (TrackActor != lastTrack &&
+                    !IsTrainPathTrack(TrackActor))
+                {
+                    TrackActor->StopBlockVisualization();
+                }
+            }
+        }
+
+        GManuallySelectedTracks.Reset();
+        GLastEnteredManualTrain.Reset();
+
+        GManualSelectionAccumulatedPenalty = 0.0f;
+        GManualSelectionAccumulatedPenaltyTrain = 0.0f;
+        GManualSelectionMinimumPenalty = 0.0f;
+        GManualSelectionMaximumPenalty = 0.0f;
+    }
 
 
     static void StopHighlightedTrainPath()
@@ -49,9 +131,17 @@ namespace
         for (TWeakObjectPtr<AFGBuildableRailroadTrack>& Track :
             GHighlightedPathTracks)
         {
-            if (Track.IsValid() && Track.Get() != lastTrack)
+            if (!Track.IsValid())
             {
-                Track->StopBlockVisualization();
+                continue;
+            }
+
+            AFGBuildableRailroadTrack* TrackActor = Track.Get();
+
+            if (TrackActor != lastTrack &&
+                !IsManuallySelectedTrack(TrackActor))
+            {
+                TrackActor->StopBlockVisualization();
             }
         }
 
@@ -78,6 +168,7 @@ namespace
     {
         StopHighlightedTrainPath();
         ClearTrackConnectionMarkers();
+        ClearManualTrackSelection();
 
         if (lastTrack)
         {
@@ -262,11 +353,6 @@ namespace
 
                 continue;
             }
-
-            if (!ContainsTrack(DesiredTracks, Track))
-            {
-                DesiredTracks.Add(Track);
-            }
         }
 
         /*
@@ -282,7 +368,8 @@ namespace
             }
 
             if (!ContainsTrack(DesiredTracks, OldTrack.Get()) &&
-                OldTrack.Get() != lastTrack)
+                OldTrack.Get() != lastTrack &&
+                !IsManuallySelectedTrack(OldTrack.Get()))
             {
                 OldTrack->StopBlockVisualization();
             }
@@ -627,7 +714,9 @@ namespace
             if (lastTrack != nTrack)
             {
                 if (lastTrack &&
-                    !ContainsTrack(GHighlightedPathTracks, lastTrack))
+                    lastTrack != nTrack &&
+                    !IsManuallySelectedTrack(lastTrack) &&
+                    !IsTrainPathTrack(lastTrack))
                 {
                     lastTrack->StopBlockVisualization();
                 }
@@ -640,18 +729,16 @@ namespace
         {
             ClearTrackConnectionMarkers();
 
-            if (lastTrack &&
-                !ContainsTrack(GHighlightedPathTracks, lastTrack))
+            if (lastTrack)
             {
-                lastTrack->StopBlockVisualization();
-                lastTrack = nullptr;
-            }
-            else if (lastTrack)
-            {
-                /*
-                 * The track is still highlighted by the train path.
-                 * Only remove the connection markers, not the track highlight.
-                 */
+                AFGBuildableRailroadTrack* PreviousTrack = lastTrack;
+
+                if (!IsManuallySelectedTrack(PreviousTrack) &&
+                    !IsTrainPathTrack(PreviousTrack))
+                {
+                    PreviousTrack->StopBlockVisualization();
+                }
+
                 lastTrack = nullptr;
             }
 
@@ -689,10 +776,9 @@ namespace
             ScreenX + 1.0f,
             ScreenY + 1.0f,
             Font,
-            1.0f,   // Scale
+            1.5f,   // Scale
             false   // bDontScale
         );
-
         // 2. Cyan Text zeichnen
         HUD->DrawText(
             GInspectedTrackText,
@@ -700,10 +786,242 @@ namespace
             ScreenX,
             ScreenY,
             Font,
-            1.0f,
+            1.5f,
             false
         );
+
+        if (Config.Debug.EnableManualTrackSelection &&
+            GManuallySelectedTracks.Num() > 0)
+        {
+            const FString ManualSelectionText = FString::Printf(
+                TEXT(
+                    "Manual Track Selection\n"
+                    "Tracks: %d\n"
+                    "Accumulated penalty: %.4f\n"
+                    "Minimum segment penalty: %.4f\n"
+                    "Maximum segment penalty: %.4f\n"
+                    "Accumulated penalty with current Train: %.4f"
+                ),
+                GManuallySelectedTracks.Num(),
+                GManualSelectionAccumulatedPenalty,
+                GManualSelectionMinimumPenalty,
+                GManualSelectionMaximumPenalty,
+                GManualSelectionAccumulatedPenaltyTrain
+            );
+
+            const float SelectionScreenX = 50.0f;
+            const float SelectionScreenY = 500.0f;
+
+            HUD->DrawText(
+                ManualSelectionText,
+                FLinearColor::Black,
+                SelectionScreenX + 1.0f,
+                SelectionScreenY + 1.0f,
+                Font,
+                1.5f,
+                false
+            );
+
+            HUD->DrawText(
+                ManualSelectionText,
+                FLinearColor(1.0f, 0.8f, 0.1f, 1.0f),
+                SelectionScreenX,
+                SelectionScreenY,
+                Font,
+                1.5f,
+                false
+            );
+        }
     }
+}
+
+static AFGRailroadVehicle* GetPlayerRailroadVehicle(
+    AFGPlayerController* PlayerController)
+{
+    if (!IsValid(PlayerController))
+    {
+        return nullptr;
+    }
+
+    APawn* PlayerPawn = PlayerController->GetPawn();
+
+    if (AFGRailroadVehicle* RailroadVehicle =
+        Cast<AFGRailroadVehicle>(PlayerPawn))
+    {
+        return RailroadVehicle;
+    }
+
+    AFGCharacterPlayer* Character =
+        Cast<AFGCharacterPlayer>(PlayerPawn);
+
+    if (!IsValid(Character) ||
+        !IsValid(PlayerController->GetWorld()))
+    {
+        return nullptr;
+    }
+
+    for (TActorIterator<AFGLocomotive> Iterator(
+        PlayerController->GetWorld());
+        Iterator;
+        ++Iterator)
+    {
+        AFGLocomotive* Locomotive = *Iterator;
+
+        if (IsValid(Locomotive) &&
+            Locomotive->GetDriver() == Character)
+        {
+            return Locomotive;
+        }
+    }
+
+    return nullptr;
+}
+
+static void RecalculateManualSelectionStatistics(
+    AFGPlayerController* PlayerController)
+{
+    if (!IsValid(PlayerController))
+    {
+        return;
+    }
+
+    const FTrainPathingConfigStruct Config =
+        FTrainPathingConfigStruct::GetActiveConfig(PlayerController);
+
+    FRailroadGraphAStarFilter OriginalFilter;
+    FFactorioRailroadAStarFilter Filter(OriginalFilter, Config);
+
+    GManualSelectionAccumulatedPenalty = 0.0f;
+    GManualSelectionAccumulatedPenaltyTrain = 0.0f;
+    GManualSelectionMinimumPenalty = 0.0f;
+    GManualSelectionMaximumPenalty = 0.0f;
+
+    bool bHasPenalty = false;
+
+    for (const TWeakObjectPtr<AFGBuildableRailroadTrack>& Track :
+        GManuallySelectedTracks)
+    {
+        if (!Track.IsValid())
+        {
+            continue;
+        }
+        FRailroadGraphAStarPathPoint StartPoint(Track.Get()->GetConnection(0), true);
+        FRailroadGraphAStarPathPoint GoalPoint(Track.Get()->GetConnection(1));
+        const float TrackPenalty_Train =
+            Filter.GetTraversalCost(StartPoint, GoalPoint);
+
+        const float TrackPenalty =
+            Filter.GetTraversalCost(
+                StartPoint,
+                GoalPoint,
+                GLastEnteredManualTrain.Get());
+
+        GManualSelectionAccumulatedPenalty += TrackPenalty;
+        GManualSelectionAccumulatedPenaltyTrain += TrackPenalty_Train;
+
+        if (!bHasPenalty)
+        {
+            GManualSelectionMinimumPenalty = TrackPenalty;
+            GManualSelectionMaximumPenalty = TrackPenalty;
+            bHasPenalty = true;
+        }
+        else
+        {
+            GManualSelectionMinimumPenalty =
+                FMath::Min(
+                    GManualSelectionMinimumPenalty,
+                    TrackPenalty);
+
+            GManualSelectionMaximumPenalty =
+                FMath::Max(
+                    GManualSelectionMaximumPenalty,
+                    TrackPenalty);
+        }
+    }
+}
+
+
+static void UpdateManualTrackSelection(
+    AFGPlayerController* PlayerController)
+{
+    if (!IsValid(PlayerController))
+    {
+        return;
+    }
+
+    const FTrainPathingConfigStruct Config =
+        FTrainPathingConfigStruct::GetActiveConfig(PlayerController);
+
+    if (!Config.Debug.EnableDebugHud ||
+        !Config.Debug.EnableManualTrackSelection)
+    {
+        ClearManualTrackSelection();
+        return;
+    }
+
+    if (GManuallySelectedTracks.Num() > 0 &&
+        !GLastEnteredManualTrain.IsValid())
+    {
+        ClearManualTrackSelection();
+    }
+
+    AFGTrain* CurrentTrain =
+        GetPlayerTrain(PlayerController);
+
+    if (!IsValid(CurrentTrain))
+    {
+        return;
+    }
+
+    AFGRailroadVehicle* CurrentVehicle =
+        GetPlayerRailroadVehicle(PlayerController);
+
+    if (!IsValid(CurrentVehicle))
+    {
+        return;
+    }
+
+    AFGBuildableRailroadTrack* CurrentTrack =
+        CurrentVehicle->GetTrackPosition().Track.Get();
+
+    if (!IsValid(CurrentTrack))
+    {
+        return;
+    }
+
+    const bool bEnteredDifferentTrain =
+        GLastEnteredManualTrain.Get() != CurrentTrain;
+
+    if (CurrentTrain->mTrainStatus != ETrainStatus::TS_ManualDriving) {
+        ClearManualTrackSelection();
+        GLastEnteredManualTrain = CurrentTrain;
+        return;
+    }
+    /*
+     * Beim Betreten eines anderen Zuges bleibt die Auswahl erhalten,
+     * sofern der neue Zug auf einem bereits ausgewählten Track steht.
+     * Andernfalls beginnt eine neue Auswahl.
+     */
+    if (bEnteredDifferentTrain)
+    {
+        if (!ContainsTrack(
+            GManuallySelectedTracks,
+            CurrentTrack))
+        {
+            ClearManualTrackSelection();
+        }
+
+        GLastEnteredManualTrain = CurrentTrain;
+    }
+
+    if (!ContainsTrack(
+        GManuallySelectedTracks,
+        CurrentTrack) && CurrentTrain->IsPlayerDriven())
+    {
+        GManuallySelectedTracks.Add(CurrentTrack);
+        CurrentTrack->ShowBlockVisualization();
+    }
+    RecalculateManualSelectionStatistics(PlayerController);
 }
 
 namespace TrainPathingDebug
@@ -722,6 +1040,7 @@ namespace TrainPathingDebug
                 {
                     UpdateInspectedTrackData(self, DeltaSeconds);
                     UpdatePlayerTrainPathVisualization(self);
+                    UpdateManualTrackSelection(self);
                 }
             });
 

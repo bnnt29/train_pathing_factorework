@@ -12,6 +12,7 @@ struct FTrainPathingConfigStruct_Other;
 struct FTrainPathingConfigStruct_Trains_SelfDriving;
 struct FTrainPathingConfigStruct_Platforms_CargoPlatform;
 struct FTrainPathingConfigStruct_Platforms_Docking;
+struct FTrainPathingConfigStruct_Tracks_Thresholds;
 
 USTRUCT(BlueprintType)
 struct FTrainPathingConfigStruct_Trains_SelfDriving {
@@ -74,6 +75,17 @@ public:
 };
 
 USTRUCT(BlueprintType)
+struct FTrainPathingConfigStruct_Tracks_Thresholds {
+    GENERATED_BODY()
+public:
+    UPROPERTY(BlueprintReadWrite)
+    float TightCurveRadiusThreshold{};
+
+    UPROPERTY(BlueprintReadWrite)
+    float ClimbingSlopeThreshold{};
+};
+
+USTRUCT(BlueprintType)
 struct FTrainPathingConfigStruct_Debug {
     GENERATED_BODY()
 public:
@@ -85,6 +97,9 @@ public:
 
     UPROPERTY(BlueprintReadWrite)
     bool UseOriginalPathFinding{};
+
+    UPROPERTY(BlueprintReadWrite)
+    bool EnableManualTrackSelection{};
 };
 
 USTRUCT(BlueprintType)
@@ -111,6 +126,9 @@ public:
 
     UPROPERTY(BlueprintReadWrite)
     FTrainPathingConfigStruct_Trains_SelfDriving SelfDriving{};
+
+    UPROPERTY(BlueprintReadWrite)
+    float PathReservationPenalty{};
 };
 
 USTRUCT(BlueprintType)
@@ -134,6 +152,17 @@ USTRUCT(BlueprintType)
 struct FTrainPathingConfigStruct_Tracks {
     GENERATED_BODY()
 public:
+    UPROPERTY(BlueprintReadWrite)
+    FTrainPathingConfigStruct_Tracks_Thresholds Thresholds{};
+
+    UPROPERTY(BlueprintReadWrite)
+    float TightCurvePenalty{};
+
+    UPROPERTY(BlueprintReadWrite)
+    float ClimbingPenalty{};
+
+    UPROPERTY(BlueprintReadWrite)
+    float DescendingSlopeBonus{};
 };
 
 USTRUCT(BlueprintType)

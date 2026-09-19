@@ -22,7 +22,8 @@ DEFINE_LOG_CATEGORY(train_pathing);
 
 float CountVehiclesOnTrack(
     AFGBuildableRailroadTrack* Track,
-    const FTrainPathingConfigStruct& Config)
+    const FTrainPathingConfigStruct& Config,
+    const AFGTrain* IgnoredTrain)
 {
     float Counts = 0.0f;
 
@@ -30,7 +31,7 @@ float CountVehiclesOnTrack(
     {
         return Counts;
     }
-
+    bool bHasNonIgnoredVehicle = false;
     for (const TObjectPtr<AFGRailroadVehicle>& Vehicle :
         Track->GetVehicles())
     {
@@ -40,6 +41,12 @@ float CountVehiclesOnTrack(
         {
             continue;
         }
+        if (IsValid(IgnoredTrain) &&
+            VehicleActor->GetTrain() == IgnoredTrain)
+        {
+            continue;
+        }
+        bHasNonIgnoredVehicle = true;
         if (AFGLocomotive* Locomotive =
             Cast<AFGLocomotive>(VehicleActor))
         {
@@ -126,6 +133,11 @@ float CountVehiclesOnTrack(
         {
             Counts += Config.Trains.DerailedVehiclePenalty;
         }
+    }
+    if (bHasNonIgnoredVehicle)
+    {
+        Counts += Track->GetLength() /
+            Config.Other.BasePenaltyScale;
     }
     return Counts;
 }
@@ -292,15 +304,263 @@ bool FFactorioRailroadAStarFilter::IsTraversalAllowed(
     return bAllowed;
 }
 
+#include "FGRailroadSubsystem.h"
 
-float FFactorioRailroadAStarFilter::CalculateFactorioPenalty(AFGBuildableRailroadTrack* Track) const
+bool DoesTrainPathContainTrack(
+    const AFGTrain* Train,
+    const AFGBuildableRailroadTrack* Track,
+    const AFGTrain* IgnoredTrain)
+{
+    if (!IsValid(Train) ||
+        !IsValid(Track) ||
+        Train == IgnoredTrain ||
+        !Train->mAtcData.Path.IsValid())
+    {
+        return false;
+    }
+
+    const TArray<FRailroadPathPoint>& PathPoints =
+        Train->mAtcData.Path->PathPoints;
+
+    if (PathPoints.Num() == 0)
+    {
+        return false;
+    }
+
+    int32 FirstUnpassedPathPoint =
+        Train->mAtcData.CurrentPathSegment;
+
+    /*
+     * CurrentPathSegment kann während der Initialisierung INDEX_NONE
+     * sein. In diesem Fall ist der Fortschritt noch unbekannt und der
+     * gesamte Pfad wird berücksichtigt.
+     */
+    if (FirstUnpassedPathPoint == INDEX_NONE)
+    {
+        FirstUnpassedPathPoint = 0;
+    }
+
+    FirstUnpassedPathPoint = FMath::Clamp(
+        FirstUnpassedPathPoint,
+        0,
+        PathPoints.Num() - 1
+    );
+
+    for (int32 PathPointIndex = FirstUnpassedPathPoint;
+        PathPointIndex < PathPoints.Num();
+        ++PathPointIndex)
+    {
+        UFGRailroadTrackConnectionComponent* Connection =
+            PathPoints[PathPointIndex].TrackConnection.Get();
+
+        if (IsValid(Connection) &&
+            Connection->GetTrack() == Track)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool IsTrackInAnyTrainPath(
+    const AFGBuildableRailroadTrack* Track,
+    const AFGTrain* IgnoredTrain)
+{
+    if (!IsValid(Track))
+    {
+        return false;
+    }
+
+    AFGRailroadSubsystem* RailroadSubsystem =
+        AFGRailroadSubsystem::Get(Track->GetWorld());
+
+    if (!IsValid(RailroadSubsystem))
+    {
+        return false;
+    }
+
+    TArray<AFGTrain*> Trains;
+    RailroadSubsystem->GetAllTrains(Trains);
+
+    for (AFGTrain* Train : Trains)
+    {
+        if (!IsValid(Train) ||
+            Train == IgnoredTrain ||
+            Train->GetTrackGraphID() != Track->GetTrackGraphID())
+        {
+            continue;
+        }
+
+        if (DoesTrainPathContainTrack(Train, Track,
+            IgnoredTrain))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+namespace
+{
+    float CalculateTrackGeometryPenalty(
+        const AFGBuildableRailroadTrack* Track,
+        const FTrainPathingConfigStruct& Config)
+    {
+        if (!IsValid(Track))
+        {
+            return 0.0f;
+        }
+
+        USplineComponent* Spline = Track->GetSplineComponent();
+
+        if (!IsValid(Spline))
+        {
+            return 0.0f;
+        }
+
+        const float SplineLength = Spline->GetSplineLength();
+
+        if (SplineLength <= KINDA_SMALL_NUMBER)
+        {
+            return 0.0f;
+        }
+
+        constexpr float SampleDistance = 250.0f;
+        const int32 SampleCount = FMath::Max(
+            1,
+            FMath::CeilToInt(SplineLength / SampleDistance));
+
+        const float DistanceStep = SplineLength /
+            static_cast<float>(SampleCount);
+
+        float Penalty = 0.0f;
+
+        for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
+        {
+            const float StartDistance =
+                static_cast<float>(SampleIndex) * DistanceStep;
+            const float EndDistance =
+                static_cast<float>(SampleIndex + 1) * DistanceStep;
+
+            const FVector StartLocation =
+                Spline->GetLocationAtDistanceAlongSpline(
+                    StartDistance,
+                    ESplineCoordinateSpace::World);
+
+            const FVector EndLocation =
+                Spline->GetLocationAtDistanceAlongSpline(
+                    EndDistance,
+                    ESplineCoordinateSpace::World);
+
+            const FVector StartTangent =
+                Spline->GetTangentAtDistanceAlongSpline(
+                    StartDistance,
+                    ESplineCoordinateSpace::World).GetSafeNormal();
+
+            const FVector EndTangent =
+                Spline->GetTangentAtDistanceAlongSpline(
+                    EndDistance,
+                    ESplineCoordinateSpace::World).GetSafeNormal();
+
+            const float HorizontalDistance = FVector2D(
+                EndLocation.X - StartLocation.X,
+                EndLocation.Y - StartLocation.Y).Size();
+
+            if (HorizontalDistance > KINDA_SMALL_NUMBER)
+            {
+                const float Slope =
+                    (EndLocation.Z - StartLocation.Z) /
+                    HorizontalDistance;
+
+                if (Slope > Config.Tracks.Thresholds.ClimbingSlopeThreshold)
+                {
+                    const float SlopeIntensity =
+                        (Slope - Config.Tracks.Thresholds.ClimbingSlopeThreshold) /
+                        FMath::Max(
+                            Config.Tracks.Thresholds.ClimbingSlopeThreshold,
+                            KINDA_SMALL_NUMBER);
+
+                    Penalty +=
+                        SlopeIntensity *
+                        Config.Tracks.ClimbingPenalty *
+                        (DistanceStep / 100000.0f);
+                }
+                else if (Slope < -Config.Tracks.Thresholds.ClimbingSlopeThreshold)
+                {
+                    const float DescendingIntensity =
+                        (-Slope - Config.Tracks.Thresholds.ClimbingSlopeThreshold) /
+                        FMath::Max(
+                            Config.Tracks.Thresholds.ClimbingSlopeThreshold,
+                            KINDA_SMALL_NUMBER);
+
+                    Penalty -=
+                        DescendingIntensity *
+                        Config.Tracks.DescendingSlopeBonus *
+                        (DistanceStep / 100000.0f);
+                }
+            }
+
+            if (!StartTangent.IsNearlyZero() &&
+                !EndTangent.IsNearlyZero())
+            {
+                const float TangentDot =
+                    FMath::Clamp(
+                        FVector::DotProduct(StartTangent, EndTangent),
+                        -1.0f,
+                        1.0f);
+
+                const float AngleChange =
+                    FMath::Acos(TangentDot);
+
+                if (AngleChange > KINDA_SMALL_NUMBER)
+                {
+                    // Radius = arc length / angle in radians.
+                    const float Radius = DistanceStep / AngleChange;
+
+                    if (Radius <
+                        Config.Tracks.Thresholds.TightCurveRadiusThreshold)
+                    {
+                        const float CurveIntensity =
+                            1.0f -
+                            Radius /
+                            FMath::Max(
+                                Config.Tracks.Thresholds.TightCurveRadiusThreshold,
+                                KINDA_SMALL_NUMBER);
+
+                        Penalty +=
+                            CurveIntensity *
+                            Config.Tracks.TightCurvePenalty *
+                            (DistanceStep / 100000.0f);
+                    }
+                }
+            }
+        }
+
+        return Penalty;
+    }
+}
+
+
+float FFactorioRailroadAStarFilter::CalculateFactorioPenalty(AFGBuildableRailroadTrack* Track,
+    const AFGTrain* IgnoredTrain) const
 {
     float Penalty = 0.0f;
     if (!IsValid(Track)) {
         return Penalty;
     }
     Penalty += CountStationPlatforms(Track->GetConnection(0), Config) + CountStationPlatforms(Track->GetConnection(1), Config);
-    Penalty += CountVehiclesOnTrack(Track, Config);
+    Penalty += CountVehiclesOnTrack(Track, Config,
+        IgnoredTrain);
+    Penalty += CalculateTrackGeometryPenalty(
+        Track,
+        Config);
+    if (IsTrackInAnyTrainPath(Track, IgnoredTrain))
+    {
+        // Beispielwert
+        Penalty += Config.Trains.PathReservationPenalty;
+    }
     //Conn->GetTrack()->IsOccupied();
     // Block & Signal inspection
     // 14. Block has Path reservation: +25
@@ -325,7 +585,8 @@ float FFactorioRailroadAStarFilter::CalculateFactorioPenalty(AFGBuildableRailroa
 
 float FFactorioRailroadAStarFilter::GetTraversalCost(
     const FRailroadGraphAStarPathPoint& StartNodeRef,
-    const FRailroadGraphAStarPathPoint& EndNodeRef) const
+    const FRailroadGraphAStarPathPoint& EndNodeRef,
+    const AFGTrain* IgnoredTrain) const
 {
     float OrigCost = BaseFilter.GetTraversalCost(StartNodeRef, EndNodeRef);
 
@@ -348,9 +609,8 @@ float FFactorioRailroadAStarFilter::GetTraversalCost(
 
     // Base Cost (Rule 16: Length, slope, curvature adjustments)
     float BaseCost = SegmentLength;
-
     // Apply Factorio Penalty Table
-    float Penalty = CalculateFactorioPenalty(Track);
+    float Penalty = CalculateFactorioPenalty(Track, IgnoredTrain);
     float NewCost = BaseCost + Penalty * Config.Other.BasePenaltyScale;
     //UE_LOG(train_pathing, Verbose, TEXT("Traversal = %f <=> %f"), OrigCost, NewCost);
     return NewCost;
@@ -797,6 +1057,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     }
     scope.Override(Result);
 }
+
 
 void Ftrain_pathing_factoreworkModule::StartupModule()
 {
