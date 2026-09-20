@@ -61,6 +61,9 @@ public:
 
     UPROPERTY(BlueprintReadWrite)
     float IdlePenalty{};
+
+    UPROPERTY(BlueprintReadWrite)
+    float CargoBasePenalty{};
 };
 
 USTRUCT(BlueprintType)

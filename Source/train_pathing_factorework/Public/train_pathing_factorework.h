@@ -54,8 +54,10 @@ struct TRAIN_PATHING_FACTOREWORK_API FFactorioRailroadAStarFilter :
 
 private:
     float CalculateFactorioPenalty(
+        const FRailroadGraphAStarPathPoint& StartNodeRef,
+        const FRailroadGraphAStarPathPoint& EndNodeRef,
         AFGBuildableRailroadTrack* Track,
-        const AFGTrain* IgnoredTrain = nullptr) const;
+        const AFGTrain* IgnoredTrain) const;
 };
 
 class Ftrain_pathing_factoreworkModule : public IModuleInterface

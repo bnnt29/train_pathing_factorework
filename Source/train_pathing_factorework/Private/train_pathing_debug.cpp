@@ -32,6 +32,20 @@ DEFINE_LOG_CATEGORY(train_pathing_debug);
 
 namespace
 {
+
+    struct Trackdir
+    {
+        TWeakObjectPtr<AFGBuildableRailroadTrack> Track;
+        bool reversed;
+        Trackdir(
+            AFGBuildableRailroadTrack* InTrack,
+            bool bInReversed)
+            : Track(InTrack)
+            , reversed(bInReversed)
+        {
+        }
+    };
+
     // State variables to cache the inspected track
     static FString GInspectedTrackText = TEXT("Looking at Track: [None]");
     static float GTrackTraceTimer = 0.0f;
@@ -42,8 +56,7 @@ namespace
     static TWeakObjectPtr<AFGTrain> GHighlightedTrain;
     static FRailroadPathSharedPtr GHighlightedPath;
     static TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>> GHighlightedPathTracks;
-    static TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>>
-        GManuallySelectedTracks;
+    static TArray<Trackdir> GManuallySelectedTracks;
 
     static float GManualSelectionAccumulatedPenalty = 0.0f;
     static float GManualSelectionAccumulatedPenaltyTrain = 0.0f;
@@ -53,7 +66,33 @@ namespace
 
     static bool ContainsTrack(
         const TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>>& Tracks,
-        AFGBuildableRailroadTrack* Track);
+        AFGBuildableRailroadTrack* Track)
+    {
+        for (const TWeakObjectPtr<AFGBuildableRailroadTrack>& ExistingTrack : Tracks)
+        {
+            if (ExistingTrack.Get() == Track)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool ContainsTrack(
+        const TArray<Trackdir>& Tracks,
+        AFGBuildableRailroadTrack* Track)
+    {
+        for (const Trackdir& ExistingTrack : Tracks)
+        {
+            if (ExistingTrack.Track.Get() == Track)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     static bool IsManuallySelectedTrack(
         AFGBuildableRailroadTrack* Track)
@@ -97,12 +136,13 @@ namespace
 
     static void ClearManualTrackSelection()
     {
-        for (TWeakObjectPtr<AFGBuildableRailroadTrack>& Track :
+        for (Trackdir& Trackd :
             GManuallySelectedTracks)
         {
-            if (Track.IsValid())
+            if (Trackd.Track.IsValid())
             {
-                AFGBuildableRailroadTrack* TrackActor = Track.Get();
+                AFGBuildableRailroadTrack* TrackActor =
+                    Trackd.Track.Get();
 
                 /*
                  * Der Track kann gleichzeitig Teil des berechneten Pfades
@@ -178,21 +218,6 @@ namespace
 
         GInspectedTrackText.Empty();
         GTrackTraceTimer = 0.0f;
-    }
-
-    static bool ContainsTrack(
-        const TArray<TWeakObjectPtr<AFGBuildableRailroadTrack>>& Tracks,
-        AFGBuildableRailroadTrack* Track)
-    {
-        for (const TWeakObjectPtr<AFGBuildableRailroadTrack>& ExistingTrack : Tracks)
-        {
-            if (ExistingTrack.Get() == Track)
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 
     static AFGTrain* GetPlayerTrain(AFGPlayerController* PlayerController)
@@ -352,6 +377,10 @@ namespace
                 );
 
                 continue;
+            }
+            if (!ContainsTrack(DesiredTracks, Track))
+            {
+                DesiredTracks.Add(Track);
             }
         }
 
@@ -672,15 +701,80 @@ namespace
             FRailroadGraphAStarFilter origFilter;
             FFactorioRailroadAStarFilter Filter(origFilter, Config);
 
+            /*
+             * Ein A*-Kantenpaar (StartNodeRef, EndNodeRef) beschreibt das
+             * Durchqueren GENAU EINES Tracks: EndNodeRef liegt auf diesem
+             * Track (dem hier betrachteten "nTrack"), während StartNodeRef
+             * auf dem VORHERIGEN, physisch damit verbundenen Track liegt.
+             * BeginningConnection/EndConnection sind beide Enden von nTrack
+             * selbst und dürfen daher NICHT gleichzeitig als Start und Ende
+             * eines Kantenpaars verwendet werden - das würde bedeuten, der
+             * "vorherige Track" wäre identisch mit nTrack selbst.
+             *
+             * Stattdessen wird die tatsächliche Eintritts-Connection über
+             * die reale Verbindung zum vorherigen Track ermittelt:
+             * EntryConnection->GetConnection() liefert die gegenüberliegende
+             * Connection auf dem vorherigen Track.
+             *
+             * Da ein frei betrachteter Track keine Fahrtrichtung hat, werden
+             * beide möglichen Durchquerungsrichtungen ausgewertet.
+             */
+            UFGRailroadTrackConnectionComponent* PrevTrackConnFromBeginning =
+                BeginningConnection->GetConnection();
+
+            UFGRailroadTrackConnectionComponent* PrevTrackConnFromEnd =
+                EndConnection->GetConnection();
+
+            const bool bHasForwardPrev = IsValid(PrevTrackConnFromBeginning);
+            const bool bHasReversePrev = IsValid(PrevTrackConnFromEnd);
+
+            const float ForwardHeuristic = bHasForwardPrev
+                ? Filter.GetHeuristicCost(
+                    FRailroadGraphAStarPathPoint(PrevTrackConnFromBeginning),
+                    FRailroadGraphAStarPathPoint(EndConnection))
+                : 0.0f;
+
+            const float ForwardTraversal = bHasForwardPrev
+                ? Filter.GetTraversalCost(
+                    FRailroadGraphAStarPathPoint(PrevTrackConnFromBeginning),
+                    FRailroadGraphAStarPathPoint(EndConnection))
+                : 0.0f;
+
+            const bool bForwardAllowed = bHasForwardPrev
+                ? Filter.IsTraversalAllowed(
+                    FRailroadGraphAStarPathPoint(PrevTrackConnFromBeginning),
+                    FRailroadGraphAStarPathPoint(EndConnection))
+                : false;
+
+            const float ReverseHeuristic = bHasReversePrev
+                ? Filter.GetHeuristicCost(
+                    FRailroadGraphAStarPathPoint(PrevTrackConnFromEnd),
+                    FRailroadGraphAStarPathPoint(BeginningConnection))
+                : 0.0f;
+
+            const float ReverseTraversal = bHasReversePrev
+                ? Filter.GetTraversalCost(
+                    FRailroadGraphAStarPathPoint(PrevTrackConnFromEnd),
+                    FRailroadGraphAStarPathPoint(BeginningConnection))
+                : 0.0f;
+
+            const bool bReverseAllowed = bHasReversePrev
+                ? Filter.IsTraversalAllowed(
+                    FRailroadGraphAStarPathPoint(PrevTrackConnFromEnd),
+                    FRailroadGraphAStarPathPoint(BeginningConnection))
+                : false;
+
             GInspectedTrackText = FString::Printf(
                 TEXT(
                     "Looking at Track: %s | Ptr: %p\n"
                     "Length: %f\n"
                     "Beginning [0]: %p\n"
                     "End [1]: %p\n"
+                    "Forward PrevConn: %p%s\n"
                     "Heuristics: %f\n"
                     "Traversal: %f\n"
                     "IsTraversalAllowed: %d\n"
+                    "Reverse PrevConn: %p%s\n"
                     "Rev Heuristics: %f\n"
                     "Rev Traversal: %f\n"
                     "Rev IsTraversalAllowed: %d\n"
@@ -690,24 +784,16 @@ namespace
                 nTrack->GetLength(),
                 BeginningConnection,
                 EndConnection,
-                Filter.GetHeuristicCost(
-                    FRailroadGraphAStarPathPoint(BeginningConnection),
-                    FRailroadGraphAStarPathPoint(EndConnection)),
-                Filter.GetTraversalCost(
-                    FRailroadGraphAStarPathPoint(BeginningConnection),
-                    FRailroadGraphAStarPathPoint(EndConnection)),
-                Filter.IsTraversalAllowed(
-                    FRailroadGraphAStarPathPoint(BeginningConnection),
-                    FRailroadGraphAStarPathPoint(EndConnection)) ? 1 : 0,
-                Filter.GetHeuristicCost(
-                    FRailroadGraphAStarPathPoint(EndConnection),
-                    FRailroadGraphAStarPathPoint(BeginningConnection)),
-                Filter.GetTraversalCost(
-                    FRailroadGraphAStarPathPoint(EndConnection),
-                    FRailroadGraphAStarPathPoint(BeginningConnection)),
-                Filter.IsTraversalAllowed(
-                    FRailroadGraphAStarPathPoint(EndConnection),
-                    FRailroadGraphAStarPathPoint(BeginningConnection)) ? 1 : 0
+                PrevTrackConnFromBeginning,
+                bHasForwardPrev ? TEXT("") : TEXT(" (kein vorheriger Track)"),
+                ForwardHeuristic,
+                ForwardTraversal,
+                bForwardAllowed ? 1 : 0,
+                PrevTrackConnFromEnd,
+                bHasReversePrev ? TEXT("") : TEXT(" (kein vorheriger Track)"),
+                ReverseHeuristic,
+                ReverseTraversal,
+                bReverseAllowed ? 1 : 0
             );
 
             // Bestehende Blockvisualisierung beibehalten.
@@ -877,6 +963,66 @@ static AFGRailroadVehicle* GetPlayerRailroadVehicle(
     return nullptr;
 }
 
+static bool IsTrainFacingReverseOnTrack(
+    AFGRailroadVehicle* Vehicle)
+{
+    if (!IsValid(Vehicle))
+    {
+        return false;
+    }
+
+    AFGLocomotive* Locomotive =
+        Cast<AFGLocomotive>(Vehicle);
+
+    if (!IsValid(Locomotive) ||
+        !Vehicle->GetTrackPosition().IsValid())
+    {
+        return false;
+    }
+
+    AFGBuildableRailroadTrack* Track =
+        Vehicle->GetTrackPosition().Track.Get();
+
+    if (!IsValid(Track))
+    {
+        return false;
+    }
+
+    USplineComponent* Spline =
+        Track->GetSplineComponent();
+
+    if (!IsValid(Spline))
+    {
+        return false;
+    }
+
+    const FRailroadTrackPosition& TrackPosition =
+        Vehicle->GetTrackPosition();
+
+    const FVector SplineDirection =
+        Spline->GetDirectionAtDistanceAlongSpline(
+            TrackPosition.Offset,
+            ESplineCoordinateSpace::World)
+        .GetSafeNormal();
+
+    const FVector LocomotiveDirection =
+        Locomotive->GetActorForwardVector().GetSafeNormal();
+
+    if (SplineDirection.IsNearlyZero() ||
+        LocomotiveDirection.IsNearlyZero())
+    {
+        return false;
+    }
+
+    /*
+     * This is based only on the physical orientation of the
+     * locomotive, not on its movement direction.
+     */
+    return FVector::DotProduct(
+        LocomotiveDirection,
+        SplineDirection) < 0.0f;
+}
+
 static void RecalculateManualSelectionStatistics(
     AFGPlayerController* PlayerController)
 {
@@ -889,7 +1035,18 @@ static void RecalculateManualSelectionStatistics(
         FTrainPathingConfigStruct::GetActiveConfig(PlayerController);
 
     FRailroadGraphAStarFilter OriginalFilter;
-    FFactorioRailroadAStarFilter Filter(OriginalFilter, Config);
+    FFactorioRailroadAStarFilter Filter(
+        OriginalFilter,
+        Config);
+
+    AFGRailroadVehicle* MarkingVehicle =
+        GetPlayerRailroadVehicle(PlayerController);
+
+    if (!IsValid(MarkingVehicle))
+    {
+        return;
+    }
+
 
     GManualSelectionAccumulatedPenalty = 0.0f;
     GManualSelectionAccumulatedPenaltyTrain = 0.0f;
@@ -898,17 +1055,89 @@ static void RecalculateManualSelectionStatistics(
 
     bool bHasPenalty = false;
 
-    for (const TWeakObjectPtr<AFGBuildableRailroadTrack>& Track :
+    for (const Trackdir& Trackd :
         GManuallySelectedTracks)
     {
-        if (!Track.IsValid())
+        if (!Trackd.Track.IsValid())
         {
             continue;
         }
-        FRailroadGraphAStarPathPoint StartPoint(Track.Get()->GetConnection(0), true);
-        FRailroadGraphAStarPathPoint GoalPoint(Track.Get()->GetConnection(1));
+
+        AFGBuildableRailroadTrack* TrackActor =
+            Trackd.Track.Get();
+
+        if (!IsValid(TrackActor))
+        {
+            continue;
+        }
+
+        const bool bTrackIsReversed =
+            Trackd.reversed;
+        /*
+        UE_LOG(
+            train_pathing_debug,
+            Warning,
+            TEXT(
+                "Manual track evaluated: %s, Reversed=%d"
+            ),
+            *TrackActor->GetName(),
+            bTrackIsReversed ? 1 : 0
+        );
+        */
+
+        /*
+         * RearConnection und FrontConnection sind beide Enden desselben
+         * Tracks (TrackActor). Nach der A*-Semantik darf aber niemals
+         * RearConnection direkt als StartNodeRef verwendet werden, wenn
+         * FrontConnection der EndNodeRef ist - beide müssten sonst auf
+         * demselben Track liegen, was nur beim EndNodeRef korrekt ist.
+         *
+         * Der tatsächliche StartNodeRef liegt physisch auf dem VORHERIGEN
+         * Track, gemäß der Fahrtrichtung des Zuges (Orientierung, nicht
+         * Bewegungsrichtung). Dieser wird über die reale Verbindung
+         * RearConnection->GetConnection() ermittelt, die zur
+         * gegenüberliegenden Connection auf dem vorangehenden Track führt.
+         *
+         * Ist kein vorheriger Track vorhanden (z.B. Streckenende oder erster
+         * Track ohne Nachbarn), wird auf RearConnection als Fallback
+         * zurückgegriffen und IgnoredStart gesetzt, damit A*-Startlogik
+         * korrekt greift.
+         */
+        UFGRailroadTrackConnectionComponent* RearConnection =
+            bTrackIsReversed
+            ? TrackActor->GetConnection(1)
+            : TrackActor->GetConnection(0);
+
+        UFGRailroadTrackConnectionComponent* FrontConnection =
+            bTrackIsReversed
+            ? TrackActor->GetConnection(0)
+            : TrackActor->GetConnection(1);
+
+        if (!IsValid(RearConnection) ||
+            !IsValid(FrontConnection))
+        {
+            continue;
+        }
+
+        UFGRailroadTrackConnectionComponent* PreviousTrackConnection =
+            RearConnection->GetConnection();
+
+        const bool bHasPreviousTrack =
+            IsValid(PreviousTrackConnection);
+
+        FRailroadGraphAStarPathPoint StartPoint(
+            bHasPreviousTrack
+                ? PreviousTrackConnection
+                : RearConnection,
+            true);
+
+        FRailroadGraphAStarPathPoint GoalPoint(
+            FrontConnection);
+
         const float TrackPenalty_Train =
-            Filter.GetTraversalCost(StartPoint, GoalPoint);
+            Filter.GetTraversalCost(
+                StartPoint,
+                GoalPoint);
 
         const float TrackPenalty =
             Filter.GetTraversalCost(
@@ -916,8 +1145,11 @@ static void RecalculateManualSelectionStatistics(
                 GoalPoint,
                 GLastEnteredManualTrain.Get());
 
-        GManualSelectionAccumulatedPenalty += TrackPenalty;
-        GManualSelectionAccumulatedPenaltyTrain += TrackPenalty_Train;
+        GManualSelectionAccumulatedPenalty +=
+            TrackPenalty;
+
+        GManualSelectionAccumulatedPenaltyTrain +=
+            TrackPenalty_Train;
 
         if (!bHasPenalty)
         {
@@ -1016,9 +1248,27 @@ static void UpdateManualTrackSelection(
 
     if (!ContainsTrack(
         GManuallySelectedTracks,
-        CurrentTrack) && CurrentTrain->IsPlayerDriven())
+        CurrentTrack))
     {
-        GManuallySelectedTracks.Add(CurrentTrack);
+        const bool bTrainFacesReverse =
+            IsTrainFacingReverseOnTrack(CurrentVehicle);
+
+        UE_LOG(
+            train_pathing_debug,
+            Warning,
+            TEXT(
+                "Manual track recorded: %s, "
+                "Forward=%.3f, Reversed=%d"
+            ),
+            *CurrentTrack->GetName(),
+            CurrentVehicle->GetTrackPosition().Forward,
+            bTrainFacesReverse ? 1 : 0
+        );
+
+        GManuallySelectedTracks.Add(
+            Trackdir(
+                CurrentTrack,
+                bTrainFacesReverse));
         CurrentTrack->ShowBlockVisualization();
     }
     RecalculateManualSelectionStatistics(PlayerController);

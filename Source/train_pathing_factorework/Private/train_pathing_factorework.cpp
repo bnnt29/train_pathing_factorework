@@ -201,6 +201,7 @@ float CountStationPlatforms(
 
         if (Cast<AFGBuildableTrainPlatformCargo>(Platform))
         {
+            Counts += Config.Platforms.CargoPlatform.CargoBasePenalty;
             switch (Cast<AFGBuildableTrainPlatformCargo>(Platform)->GetDockingStatus()) {
                 case ETrainPlatformDockingStatus::ETPDS_WaitingToStart:
                     Counts += Config.Platforms.CargoPlatform.WaitingPenalty;
@@ -405,10 +406,14 @@ bool IsTrackInAnyTrainPath(
 namespace
 {
     float CalculateTrackGeometryPenalty(
+        const FRailroadGraphAStarPathPoint& StartNodeRef,
+        const FRailroadGraphAStarPathPoint& EndNodeRef,
         const AFGBuildableRailroadTrack* Track,
         const FTrainPathingConfigStruct& Config)
     {
-        if (!IsValid(Track))
+        if (!IsValid(Track) ||
+            !IsValid(StartNodeRef.TrackConnection) ||
+            !IsValid(EndNodeRef.TrackConnection))
         {
             return 0.0f;
         }
@@ -427,6 +432,49 @@ namespace
             return 0.0f;
         }
 
+        /*
+         * Track ist immer der Track des EndNode: Nur EndNodeRef.TrackConnection
+         * liegt tatsächlich auf diesem Track (an einem seiner beiden Enden).
+         * StartNodeRef.TrackConnection liegt hingegen am gegenüberliegenden Ende
+         * des VORHERIGEN Tracks und gehört daher nicht zu Track. Die Richtung,
+         * in der wir Track durchqueren, ergibt sich somit ausschließlich aus der
+         * Position von EndNodeRef auf Track: Betreten wird Track immer am
+         * jeweils anderen Ende.
+         */
+        const bool bEndIsConnection0 =
+            EndNodeRef.TrackConnection ==
+            Track->GetConnection(0);
+
+        const bool bEndIsConnection1 =
+            EndNodeRef.TrackConnection ==
+            Track->GetConnection(1);
+
+        if (!bEndIsConnection0 &&
+            !bEndIsConnection1)
+        {
+            UE_LOG(
+                train_pathing,
+                Warning,
+                TEXT(
+                    "End connection does not belong to track %s "
+                    "(Start=%p, End=%p, TrackConnection0=%p, TrackConnection1=%p)"
+                ),
+                *Track->GetName(),
+                StartNodeRef.TrackConnection,
+                EndNodeRef.TrackConnection,
+                Track->GetConnection(0),
+                Track->GetConnection(1)
+            );
+
+            return 0.0f;
+        }
+
+        // Betreten wir Track an Connection1, kommen wir von Connection0 und
+        // fahren somit in Spline-Vorwärtsrichtung (0 -> Länge).
+        // Betreten wir Track an Connection0, kommen wir von Connection1 und
+        // fahren somit in Spline-Rückwärtsrichtung (Länge -> 0).
+        const bool bReverse = bEndIsConnection0;
+
         constexpr float SampleDistance = 250.0f;
         const int32 SampleCount = FMath::Max(
             1,
@@ -439,10 +487,26 @@ namespace
 
         for (int32 SampleIndex = 0; SampleIndex < SampleCount; ++SampleIndex)
         {
-            const float StartDistance =
+            const float ForwardStartDistance =
                 static_cast<float>(SampleIndex) * DistanceStep;
-            const float EndDistance =
+            const float ForwardEndDistance =
                 static_cast<float>(SampleIndex + 1) * DistanceStep;
+
+            /*
+             * Im Reverse-Fall muss nicht nur die Iterationsreihenfolge über
+             * die Segmente umgedreht werden, sondern auch die Zuordnung von
+             * Start- und Enddistanz innerhalb jedes Segments. Andernfalls
+             * liegt StartLocation immer am spline-nahen (kleineren)
+             * Distanzwert, wodurch das Vorzeichen der Steigung unabhängig
+             * von der tatsächlichen Fahrtrichtung immer gleich bliebe.
+             */
+            const float StartDistance = bReverse
+                ? SplineLength - ForwardStartDistance
+                : ForwardStartDistance;
+
+            const float EndDistance = bReverse
+                ? SplineLength - ForwardEndDistance
+                : ForwardEndDistance;
 
             const FVector StartLocation =
                 Spline->GetLocationAtDistanceAlongSpline(
@@ -457,29 +521,45 @@ namespace
             const FVector StartTangent =
                 Spline->GetTangentAtDistanceAlongSpline(
                     StartDistance,
-                    ESplineCoordinateSpace::World).GetSafeNormal();
+                    ESplineCoordinateSpace::World)
+                .GetSafeNormal();
 
             const FVector EndTangent =
                 Spline->GetTangentAtDistanceAlongSpline(
                     EndDistance,
-                    ESplineCoordinateSpace::World).GetSafeNormal();
+                    ESplineCoordinateSpace::World)
+                .GetSafeNormal();
 
-            const float HorizontalDistance = FVector2D(
-                EndLocation.X - StartLocation.X,
-                EndLocation.Y - StartLocation.Y).Size();
+            const float HorizontalDistance =
+                FVector2D(
+                    EndLocation.X - StartLocation.X,
+                    EndLocation.Y - StartLocation.Y)
+                .Size();
 
             if (HorizontalDistance > KINDA_SMALL_NUMBER)
             {
+                /*
+                 * Dieser Wert ist jetzt immer relativ zur
+                 * tatsächlichen Fahrtrichtung:
+                 *
+                 *  positiv = bergauf
+                 *  negativ = bergab
+                 */
                 const float Slope =
                     (EndLocation.Z - StartLocation.Z) /
                     HorizontalDistance;
 
-                if (Slope > Config.Tracks.Thresholds.ClimbingSlopeThreshold)
+                if (Slope >
+                    Config.Tracks.Thresholds
+                    .ClimbingSlopeThreshold)
                 {
                     const float SlopeIntensity =
-                        (Slope - Config.Tracks.Thresholds.ClimbingSlopeThreshold) /
+                        (Slope -
+                            Config.Tracks.Thresholds
+                            .ClimbingSlopeThreshold) /
                         FMath::Max(
-                            Config.Tracks.Thresholds.ClimbingSlopeThreshold,
+                            Config.Tracks.Thresholds
+                            .ClimbingSlopeThreshold,
                             KINDA_SMALL_NUMBER);
 
                     Penalty +=
@@ -487,12 +567,17 @@ namespace
                         Config.Tracks.ClimbingPenalty *
                         (DistanceStep / 100000.0f);
                 }
-                else if (Slope < -Config.Tracks.Thresholds.ClimbingSlopeThreshold)
+                else if (Slope <
+                    -Config.Tracks.Thresholds
+                    .ClimbingSlopeThreshold)
                 {
                     const float DescendingIntensity =
-                        (-Slope - Config.Tracks.Thresholds.ClimbingSlopeThreshold) /
+                        (-Slope -
+                            Config.Tracks.Thresholds
+                            .ClimbingSlopeThreshold) /
                         FMath::Max(
-                            Config.Tracks.Thresholds.ClimbingSlopeThreshold,
+                            Config.Tracks.Thresholds
+                            .ClimbingSlopeThreshold,
                             KINDA_SMALL_NUMBER);
 
                     Penalty -=
@@ -523,7 +608,7 @@ namespace
                         Config.Tracks.Thresholds.TightCurveRadiusThreshold)
                     {
                         const float CurveIntensity =
-                            1.0f -
+                            1.0f - 
                             Radius /
                             FMath::Max(
                                 Config.Tracks.Thresholds.TightCurveRadiusThreshold,
@@ -543,17 +628,19 @@ namespace
 }
 
 
-float FFactorioRailroadAStarFilter::CalculateFactorioPenalty(AFGBuildableRailroadTrack* Track,
+float FFactorioRailroadAStarFilter::CalculateFactorioPenalty(const FRailroadGraphAStarPathPoint& StartNodeRef,
+    const FRailroadGraphAStarPathPoint& EndNodeRef, AFGBuildableRailroadTrack* Track,
     const AFGTrain* IgnoredTrain) const
 {
     float Penalty = 0.0f;
     if (!IsValid(Track)) {
         return Penalty;
     }
-    Penalty += CountStationPlatforms(Track->GetConnection(0), Config) + CountStationPlatforms(Track->GetConnection(1), Config);
-    Penalty += CountVehiclesOnTrack(Track, Config,
-        IgnoredTrain);
+    Penalty += CountStationPlatforms(EndNodeRef.TrackConnection, Config);
+    Penalty += CountVehiclesOnTrack(Track, Config, IgnoredTrain);
     Penalty += CalculateTrackGeometryPenalty(
+        StartNodeRef,
+        EndNodeRef,
         Track,
         Config);
     if (IsTrackInAnyTrainPath(Track, IgnoredTrain))
@@ -583,37 +670,123 @@ float FFactorioRailroadAStarFilter::CalculateFactorioPenalty(AFGBuildableRailroa
     return Penalty;
 }
 
+
+namespace
+{
+    void LogTraversalConnectionDebug(
+        const TCHAR* Label,
+        UFGRailroadTrackConnectionComponent* Connection)
+    {
+        if (!IsValid(Connection))
+        {
+            UE_LOG(
+                train_pathing,
+                Warning,
+                TEXT("%s: invalid connection"),
+                Label
+            );
+
+            return;
+        }
+
+        AFGBuildableRailroadTrack* Track =
+            Connection->GetTrack();
+
+        const FRailroadTrackPosition TrackPosition =
+            Connection->GetTrackPosition();
+
+        const FString TrackName = IsValid(Track)
+            ? Track->GetName()
+            : TEXT("<invalid>");
+
+        UE_LOG(
+            train_pathing,
+            Warning,
+            TEXT(
+                "%s: Connection=%p Track=%s "
+                "Offset=%.2f Forward=%.2f Location=%s"
+            ),
+            Label,
+            Connection,
+            *TrackName,
+            TrackPosition.Offset,
+            TrackPosition.Forward,
+            *Connection->GetComponentLocation().ToString()
+        );
+    }
+}
+
 float FFactorioRailroadAStarFilter::GetTraversalCost(
     const FRailroadGraphAStarPathPoint& StartNodeRef,
     const FRailroadGraphAStarPathPoint& EndNodeRef,
     const AFGTrain* IgnoredTrain) const
 {
-    float OrigCost = BaseFilter.GetTraversalCost(StartNodeRef, EndNodeRef);
-
-    if (!IsValid(StartNodeRef.TrackConnection) || !IsValid(EndNodeRef.TrackConnection))
+    if (!IsValid(StartNodeRef.TrackConnection) ||
+        !IsValid(EndNodeRef.TrackConnection))
     {
-        UE_LOG(train_pathing, Warning, TEXT("TraversalCost TrackConnection not valid (Start: %p, End: %p)"), StartNodeRef.TrackConnection, EndNodeRef.TrackConnection);
+        UE_LOG(
+            train_pathing,
+            Warning,
+            TEXT(
+                "TraversalCost TrackConnection not valid "
+                "(Start: %p, End: %p)"
+            ),
+            StartNodeRef.TrackConnection,
+            EndNodeRef.TrackConnection
+        );
+
         return 0.0f;
     }
 
-    UFGRailroadTrackConnectionComponent* ConnB = EndNodeRef.TrackConnection;
-    AFGBuildableRailroadTrack* Track = ConnB ? ConnB->GetTrack() : nullptr;
+    /*
+     * Nur EndNodeRef liegt auf dem Track, der hier tatsächlich durchquert
+     * wird ("EndTrack"). StartNodeRef liegt am gegenüberliegenden Ende des
+     * VORHERIGEN Tracks und gehört daher zu einem anderen Track-Objekt.
+     * Sämtliche Kosten (Länge, Steigung, Kurvenradius etc.) müssen deshalb
+     * ausschließlich anhand von EndTrack berechnet werden.
+     */
+    AFGBuildableRailroadTrack* EndTrack =
+        EndNodeRef.TrackConnection->GetTrack();
 
-    if (!IsValid(Track))
+    if (!IsValid(EndTrack))
     {
-        UE_LOG(train_pathing, Warning, TEXT("TraversalCost Tracks invalid (Start: %p, End: %p)"), StartNodeRef.TrackConnection->GetTrack(), Track);
+        UE_LOG(
+            train_pathing,
+            Warning,
+            TEXT(
+                "TraversalCost EndTrack invalid "
+                "(EndConnection: %p)"
+            ),
+            EndNodeRef.TrackConnection
+        );
+
         return 0.0f;
     }
 
-    float SegmentLength = Track ? Track->GetLength() : 1000.0f;
+    UE_LOG(
+        train_pathing,
+        Verbose,
+        TEXT(
+            "EndTrack: %p (Con0: %p, Con1: %p), StartCon: %p, EndCon: %p"
+        ),
+        EndTrack,
+        EndTrack->GetConnection(0),
+        EndTrack->GetConnection(1),
+        StartNodeRef.TrackConnection,
+        EndNodeRef.TrackConnection
+    );
 
-    // Base Cost (Rule 16: Length, slope, curvature adjustments)
-    float BaseCost = SegmentLength;
-    // Apply Factorio Penalty Table
-    float Penalty = CalculateFactorioPenalty(Track, IgnoredTrain);
-    float NewCost = BaseCost + Penalty * Config.Other.BasePenaltyScale;
-    //UE_LOG(train_pathing, Verbose, TEXT("Traversal = %f <=> %f"), OrigCost, NewCost);
-    return NewCost;
+    const float BaseCost = EndTrack->GetLength();
+
+    const float Penalty = CalculateFactorioPenalty(
+        StartNodeRef,
+        EndNodeRef,
+        EndTrack,
+        IgnoredTrain
+    );
+
+    return BaseCost +
+        Penalty * Config.Other.BasePenaltyScale;
 }
 
 bool FFactorioRailroadAStarFilter::WantsPartialSolution() const
@@ -644,7 +817,6 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
 {
     if (FTrainPathingConfigStruct::GetActiveConfig(locomotive).Debug.UseOriginalPathFinding) {
         scope.Override(scope(locomotive, station, filter));
-        UE_LOG(train_pathing, Verbose, TEXT("Used Original Pathfinding"));
         return;
     }
     FRailroadPathFindingResult Result;
@@ -653,7 +825,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
 
     if (!IsValid(locomotive) || !IsValid(station))
     {
-        UE_LOG(train_pathing, Verbose, TEXT("FindPathSyncHook: locomotive or station invalid (locomotive=%p, station=%p)"), locomotive, station);
+        UE_LOG(train_pathing, Warning, TEXT("FindPathSyncHook: locomotive or station invalid (locomotive=%p, station=%p)"), locomotive, station);
         scope.Override(Result);
         return;
     }
@@ -661,7 +833,6 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     // Log locomotive track position candidates
     UFGRailroadTrackConnectionComponent* LocForward = locomotive->GetTrackPosition().GetForwardConnection();
     UFGRailroadTrackConnectionComponent* LocReverse = locomotive->GetTrackPosition().GetReverseConnection();
-    UE_LOG(train_pathing, Verbose, TEXT("FindPathSyncHook: locomotive=%p, station=%p, LocForward=%p, LocReverse=%p"), locomotive, station, LocForward, LocReverse);
 
     // 1. Resolve Start & Goal Track Connections (robustly)
     UFGRailroadTrackConnectionComponent* StartConn = nullptr;
@@ -685,23 +856,9 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     {
         StationOutputConn = station->GetStationOutputConnection()->GetRailroadConnectionReference();
 
-        UE_LOG(
-            train_pathing,
-            Verbose,
-            TEXT("StationOutputConn=%p"),
-            StationOutputConn
-        );
-
         if (StationOutputConn)
         {
             UFGRailroadTrackConnectionComponent* OppositeConn = StationOutputConn->GetOpposite();
-
-            UE_LOG(
-                train_pathing,
-                Verbose,
-                TEXT("StationOutputConn opposite=%p"),
-                OppositeConn
-            );
 
             /*
              * GetStationOutputConnection() references the platform-facing
@@ -711,14 +868,6 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
             if (OppositeConn)
             {
                 GoalConn = OppositeConn;
-
-                UE_LOG(
-                    train_pathing,
-                    Verbose,
-                    TEXT("Using opposite of StationOutputConn as GoalConn: %p -> %p"),
-                    StationOutputConn,
-                    GoalConn
-                );
             }
             else
             {
@@ -739,14 +888,6 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         StationForwardConn = station->GetTrackPosition().GetForwardConnection();
         StationReverseConn = station->GetTrackPosition().GetReverseConnection();
 
-        UE_LOG(
-            train_pathing,
-            Verbose,
-            TEXT("Station track-position candidates: Forward=%p Reverse=%p"),
-            StationForwardConn,
-            StationReverseConn
-        );
-
         if (StationForwardConn)
         {
             GoalConn = StationForwardConn;
@@ -755,18 +896,11 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         {
             GoalConn = StationReverseConn;
         }
-
-        UE_LOG(
-            train_pathing,
-            Verbose,
-            TEXT("Using station track-position fallback as GoalConn=%p"),
-            GoalConn
-        );
     }
 
     if (!IsValid(StartConn) || !IsValid(GoalConn))
     {
-        UE_LOG(train_pathing, Verbose, TEXT("locomotive or station connection invalid (StartConn=%p, GoalConn=%p)"), StartConn, GoalConn);
+        UE_LOG(train_pathing, Warning, TEXT("FindPathSyncHook: locomotive or station connection invalid (StartConn=%p, GoalConn=%p)"), StartConn, GoalConn);
         Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
         scope.Override(Result);
         return;
@@ -782,16 +916,45 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     // 3. Run Custom A* with Factorio Cost Filter
     FRailroadGraphAStarHelper GraphHelper;
     FFactorioRailroadAStarFilter CustomFilter(filter, FTrainPathingConfigStruct::GetActiveConfig(locomotive));
-    UE_LOG(train_pathing, Verbose, TEXT("BaseStationPenalty %f"), CustomFilter.Config.Platforms.StationBasePenalty);
     FGraphAStar<FRailroadGraphAStarHelper> AStarSolver(GraphHelper);
-
+    UE_LOG(
+        train_pathing,
+        Verbose,
+        TEXT(
+            "New Path finding"
+        )
+    );
     TArray<FRailroadGraphAStarPathPoint> OutPathPoints;
     EGraphAStarResult AStarResult = AStarSolver.FindPath(StartPoint, GoalPoint, CustomFilter, OutPathPoints);
 
     // 3b. Validate A* result and path contents
     if (AStarResult != EGraphAStarResult::SearchSuccess)
     {
-        UE_LOG(train_pathing, Verbose, TEXT("AStar did not succeed (result=%d)"), static_cast<int32>(AStarResult));
+        UE_LOG(
+            train_pathing,
+            Warning,
+            TEXT(
+                "AStar did not succeed (result=%d). "
+                "StartConn=%p (Track=%s, TrackGraphID=%d) "
+                "GoalConn=%p (Track=%s, TrackGraphID=%d)"
+            ),
+            static_cast<int32>(AStarResult),
+            StartConn,
+            IsValid(StartConn->GetTrack())
+                ? *StartConn->GetTrack()->GetName()
+                : TEXT("<invalid>"),
+            IsValid(StartConn->GetTrack())
+                ? StartConn->GetTrack()->GetTrackGraphID()
+                : INDEX_NONE,
+            GoalConn,
+            IsValid(GoalConn->GetTrack())
+                ? *GoalConn->GetTrack()->GetName()
+                : TEXT("<invalid>"),
+            IsValid(GoalConn->GetTrack())
+                ? GoalConn->GetTrack()->GetTrackGraphID()
+                : INDEX_NONE
+        );
+
         Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
         scope.Override(Result);
         return;
@@ -850,13 +1013,6 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         {
             NormalizedConns.Add(GoalConn);
             bAppendedGoal = true;
-
-            UE_LOG(
-                train_pathing,
-                Verbose,
-                TEXT("Appended GoalConn=%p as final path point"),
-                GoalConn
-            );
         }
     }
 
@@ -888,13 +1044,17 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
 
                 if (ConnA && ConnB)
                 {
-                    AFGBuildableRailroadTrack* TrackA = ConnA->GetTrack();
+                    /*
+                     * Der zwischen ConnA und ConnB durchquerte Track ist immer
+                     * der Track von ConnB (dem "EndNode" dieses Segments).
+                     * ConnA liegt auf dem vorherigen Track und ist daher für
+                     * die Ermittlung des durchquerten Tracks irrelevant.
+                     */
                     AFGBuildableRailroadTrack* TrackB = ConnB->GetTrack();
 
-                    if (TrackA && TrackB && TrackA == TrackB)
+                    if (TrackB)
                     {
-                        // Both connections on same track -> use track length as approximation
-                        SegmentLen = TrackA->GetLength();
+                        SegmentLen = TrackB->GetLength();
                     }
                     else
                     {
@@ -915,7 +1075,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         scope.Override(Result);
         return;
     }
-
+    /*
     UE_LOG(train_pathing, Verbose, TEXT("Path constructed with %d points (Start=%p, Goal=%p)"), Result.Path->PathPoints.Num(), StartConn, GoalConn);
 
     switch (Result.Result)
@@ -1036,8 +1196,8 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
                 }
             }
 
-            /*UE_LOG(train_pathing, Verbose, TEXT("  %s Pt[%d] Conn=%p Owner=%s Track=%p TrackLen=%f ConnIndex=%d ForwardOffset=%f ReverseOffset=%f"),
-                *Tag, Index, C, OwnerName, T, TrackLength, ConnIndex, ForwardOffset, ReverseOffset);*/
+            UE_LOG(train_pathing, Verbose, TEXT("  %s Pt[%d] Conn=%p Owner=%s Track=%p TrackLen=%f ConnIndex=%d ForwardOffset=%f ReverseOffset=%f"),
+                *Tag, Index, C, OwnerName, T, TrackLength, ConnIndex, ForwardOffset, ReverseOffset);
         };
 
         if (Orig.Path.IsValid())
@@ -1055,6 +1215,7 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
             }
         }
     }
+    */
     scope.Override(Result);
 }
 
