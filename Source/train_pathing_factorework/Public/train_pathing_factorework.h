@@ -12,6 +12,9 @@
 #include "FGTrain.h"
 
 class AFGBuildableRailroadTrack;
+class AFGLocomotive;
+class AFGBuildableRailroadStation;
+class UFGRailroadTrackConnectionComponent;
 
 DECLARE_LOG_CATEGORY_EXTERN(train_pathing, Verbose, All);
 
@@ -23,6 +26,18 @@ TRAIN_PATHING_FACTOREWORK_API float CountVehiclesOnTrack(
 TRAIN_PATHING_FACTOREWORK_API float CountStationPlatforms(
     UFGRailroadTrackConnectionComponent* RailroadConnection,
     const FTrainPathingConfigStruct& Config);
+
+/**
+ * Runs the custom A* pathfinding starting from an arbitrary track connection (instead of always
+ * starting from the locomotive's own position), allowing callers to plan only a suffix of a route
+ * (e.g. from a signal further down the line) while keeping the untouched prefix of an existing path.
+ */
+TRAIN_PATHING_FACTOREWORK_API FRailroadPathFindingResult FindPathSyncFrom(
+    AFGLocomotive* locomotive,
+    UFGRailroadTrackConnectionComponent* startConnection,
+    bool bIgnoredStart,
+    AFGBuildableRailroadStation* station,
+    FRailroadGraphAStarFilter filter);
 
 struct TRAIN_PATHING_FACTOREWORK_API FFactorioRailroadAStarFilter :
     public FRailroadGraphAStarFilter

@@ -800,42 +800,27 @@ bool FFactorioRailroadAStarFilter::ShouldIncludeStartNodeInPath() const
 #endif
 
 
-void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
+FRailroadPathFindingResult FindPathSyncFrom(
+    AFGLocomotive* locomotive,
+    UFGRailroadTrackConnectionComponent* startConnection,
+    bool bIgnoredStart,
     AFGBuildableRailroadStation* station,
     FRailroadGraphAStarFilter filter)
 {
-    if (FTrainPathingConfigStruct::GetActiveConfig(locomotive).Debug.UseOriginalPathFinding) {
-        scope.Override(scope(locomotive, station, filter));
-        return;
-    }
     FRailroadPathFindingResult Result;
     Result.Locomotive = locomotive;
     Result.Result = ERailroadPathFindingResult::RPFR_Error;
 
-    if (!IsValid(locomotive) || !IsValid(station))
+    if (!IsValid(locomotive) || !IsValid(station) || !IsValid(startConnection))
     {
-        UE_LOG(train_pathing, Warning, TEXT("FindPathSyncHook: locomotive or station invalid (locomotive=%p, station=%p)"), locomotive, station);
-        scope.Override(Result);
-        return;
+        UE_LOG(train_pathing, Warning,
+            TEXT("FindPathSyncFrom: locomotive, station or startConnection invalid (locomotive=%p, station=%p, startConnection=%p)"),
+            locomotive, station, startConnection);
+        Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
+        return Result;
     }
 
-    // Log locomotive track position candidates
-    UFGRailroadTrackConnectionComponent* LocForward = locomotive->GetTrackPosition().GetForwardConnection();
-    UFGRailroadTrackConnectionComponent* LocReverse = locomotive->GetTrackPosition().GetReverseConnection();
-
-    // 1. Resolve Start & Goal Track Connections (robustly)
-    UFGRailroadTrackConnectionComponent* StartConn = nullptr;
-    {
-        if (LocForward)
-        {
-            StartConn = LocForward;
-        }
-        else
-        {
-            StartConn = locomotive->GetTrackPosition().GetReverseConnection();
-        }
-    }
-
+    UFGRailroadTrackConnectionComponent* StartConn = startConnection;
     UFGRailroadTrackConnectionComponent* GoalConn = nullptr;
     UFGRailroadTrackConnectionComponent* StationOutputConn = nullptr;
     UFGRailroadTrackConnectionComponent* StationForwardConn = nullptr;
@@ -889,20 +874,19 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
 
     if (!IsValid(StartConn) || !IsValid(GoalConn))
     {
-        UE_LOG(train_pathing, Warning, TEXT("FindPathSyncHook: locomotive or station connection invalid (StartConn=%p, GoalConn=%p)"), StartConn, GoalConn);
+        UE_LOG(train_pathing, Warning, TEXT("FindPathSyncFrom: start or station connection invalid (StartConn=%p, GoalConn=%p)"), StartConn, GoalConn);
         Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
-        scope.Override(Result);
-        return;
+        return Result;
     }
 
     Result.Goal = GoalConn;
 
-    // 2. Setup A* Points
+    // Setup A* Points
     // IMPORTANT: mark the start as an ignored-start so that A* does not treat it as matching the end incorrectly
-    FRailroadGraphAStarPathPoint StartPoint(StartConn, true);
+    FRailroadGraphAStarPathPoint StartPoint(StartConn, bIgnoredStart);
     FRailroadGraphAStarPathPoint GoalPoint(GoalConn);
 
-    // 3. Run Custom A* with Factorio Cost Filter
+    // Run Custom A* with Factorio Cost Filter
     FRailroadGraphAStarHelper GraphHelper;
     FFactorioRailroadAStarFilter CustomFilter(filter, FTrainPathingConfigStruct::GetActiveConfig(locomotive));
     FGraphAStar<FRailroadGraphAStarHelper> AStarSolver(GraphHelper);
@@ -910,13 +894,14 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         train_pathing,
         Verbose,
         TEXT(
-            "New Path finding"
-        )
+            "New Path finding (from %p)"
+        ),
+        StartConn
     );
     TArray<FRailroadGraphAStarPathPoint> OutPathPoints;
     EGraphAStarResult AStarResult = AStarSolver.FindPath(StartPoint, GoalPoint, CustomFilter, OutPathPoints);
 
-    // 3b. Validate A* result and path contents
+    // Validate A* result and path contents
     if (AStarResult != EGraphAStarResult::SearchSuccess)
     {
         UE_LOG(
@@ -930,31 +915,29 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
             static_cast<int32>(AStarResult),
             StartConn,
             IsValid(StartConn->GetTrack())
-                ? *StartConn->GetTrack()->GetName()
-                : TEXT("<invalid>"),
+            ? *StartConn->GetTrack()->GetName()
+            : TEXT("<invalid>"),
             IsValid(StartConn->GetTrack())
-                ? StartConn->GetTrack()->GetTrackGraphID()
-                : INDEX_NONE,
+            ? StartConn->GetTrack()->GetTrackGraphID()
+            : INDEX_NONE,
             GoalConn,
             IsValid(GoalConn->GetTrack())
-                ? *GoalConn->GetTrack()->GetName()
-                : TEXT("<invalid>"),
+            ? *GoalConn->GetTrack()->GetName()
+            : TEXT("<invalid>"),
             IsValid(GoalConn->GetTrack())
-                ? GoalConn->GetTrack()->GetTrackGraphID()
-                : INDEX_NONE
+            ? GoalConn->GetTrack()->GetTrackGraphID()
+            : INDEX_NONE
         );
 
         Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
-        scope.Override(Result);
-        return;
+        return Result;
     }
 
     if (OutPathPoints.Num() == 0)
     {
         UE_LOG(train_pathing, Warning, TEXT("AStar returned SearchSuccess but OutPathPoints is empty - aborting"));
         Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
-        scope.Override(Result);
-        return;
+        return Result;
     }
 
     // Normalize & sanitize path points:
@@ -980,14 +963,11 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
             NormalizedConns.Insert(StartConn, 0);
         }
     }
-    else if(NormalizedConns[0] == StartConn) {
+    else if (NormalizedConns.Num() > 0 && NormalizedConns[0] == StartConn) {
         NormalizedConns.Remove(StartConn);
     }
 
-
     // Ensure goal is present as the final path point.
-    bool bAppendedGoal = false;
-
     if (NormalizedConns.Num() == 0)
     {
         UE_LOG(
@@ -1001,11 +981,10 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
         if (NormalizedConns.Num() == 0 || NormalizedConns.Last() != GoalConn)
         {
             NormalizedConns.Add(GoalConn);
-            bAppendedGoal = true;
         }
     }
 
-    // 4. Construct the Railroad Path from normalized connections
+    // Construct the Railroad Path from normalized connections
     Result.Result = ERailroadPathFindingResult::RPFR_Success;
     Result.Path = MakeShared<FRailroadPath>();
     Result.Path->Station = station;
@@ -1061,151 +1040,49 @@ void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
     {
         UE_LOG(train_pathing, Warning, TEXT("Constructed FRailroadPath has zero PathPoints despite success - this should not happen"));
         Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
+        return Result;
+    }
+
+    return Result;
+}
+
+
+void FindPathSyncHook(auto& scope, AFGLocomotive* locomotive,
+    AFGBuildableRailroadStation* station,
+    FRailroadGraphAStarFilter filter)
+{
+    if (FTrainPathingConfigStruct::GetActiveConfig(locomotive).Debug.UseOriginalPathFinding) {
+        scope.Override(scope(locomotive, station, filter));
+        return;
+    }
+
+    if (!IsValid(locomotive) || !IsValid(station))
+    {
+        UE_LOG(train_pathing, Warning, TEXT("FindPathSyncHook: locomotive or station invalid (locomotive=%p, station=%p)"), locomotive, station);
+        FRailroadPathFindingResult Result;
+        Result.Locomotive = locomotive;
+        Result.Result = ERailroadPathFindingResult::RPFR_Error;
         scope.Override(Result);
         return;
     }
-    /*
-    UE_LOG(train_pathing, Verbose, TEXT("Path constructed with %d points (Start=%p, Goal=%p)"), Result.Path->PathPoints.Num(), StartConn, GoalConn);
 
-    switch (Result.Result)
+    // Resolve Start Track Connection from the locomotive's own position (robustly)
+    UFGRailroadTrackConnectionComponent* LocForward = locomotive->GetTrackPosition().GetForwardConnection();
+    UFGRailroadTrackConnectionComponent* StartConn = LocForward
+        ? LocForward
+        : locomotive->GetTrackPosition().GetReverseConnection();
+
+    if (!IsValid(StartConn))
     {
-    case ERailroadPathFindingResult::RPFR_Success:
-        UE_LOG(train_pathing, Verbose, TEXT("Path found"));
-        break;
-    case ERailroadPathFindingResult::RPFR_Unreachable:
-        UE_LOG(train_pathing, Verbose, TEXT("Path unreachable"));
-        break;
-    case ERailroadPathFindingResult::RPFR_Error:
-        UE_LOG(train_pathing, Verbose, TEXT("Path error"));
-        break;
-    default:
-        break;
+        UE_LOG(train_pathing, Warning, TEXT("FindPathSyncHook: locomotive has no valid track connection (locomotive=%p)"), locomotive);
+        FRailroadPathFindingResult Result;
+        Result.Locomotive = locomotive;
+        Result.Result = ERailroadPathFindingResult::RPFR_Unreachable;
+        scope.Override(Result);
+        return;
     }
-    // --- NEW: call original implementation and compare results before overriding
-    {
-        FRailroadPathFindingResult Orig = scope(locomotive, station, filter);
-        UE_LOG(train_pathing, Verbose, TEXT("OriginalFindPath returned Result=%d Path=%p"), static_cast<int32>(Orig.Result), Orig.Path.Get());
 
-        auto LogPathSummary = [](const FRailroadPathSharedPtr& P, const FString& Tag) {
-            if (!P.IsValid()) {
-                UE_LOG(train_pathing, Verbose, TEXT("[%s] Path == null"), *Tag);
-                return;
-            }
-            UE_LOG(train_pathing, Verbose, TEXT("[%s] PathPoints=%d Station=%p"), *Tag, P->PathPoints.Num(), P->Station.Get());
-            for (int32 i = 0; i < P->PathPoints.Num(); ++i)
-            {
-                const FRailroadPathPoint& PP = P->PathPoints[i];
-                UFGRailroadTrackConnectionComponent* C = PP.TrackConnection.Get();
-                FString OwnerName = C && C->GetOwner() ? C->GetOwner()->GetName() : TEXT("null");
-                UE_LOG(train_pathing, Verbose, TEXT("  [%s] Pt[%d] Conn=%p Owner=%s Dist=%f"), *Tag, i, C, *OwnerName, PP.Distance);
-            }
-            };
-        if (GoalConn)
-        {
-            AFGBuildableRailroadTrack* GoalTrack = GoalConn->GetTrack();
-            UFGRailroadTrackConnectionComponent* GoalOpposite = GoalConn->GetOpposite();
-
-            int32 GoalConnectionIndex = INDEX_NONE;
-
-            if (GoalTrack)
-            {
-                for (int32 ConnectionIndex = 0; ConnectionIndex < 2; ++ConnectionIndex)
-                {
-                    if (GoalTrack->GetConnection(ConnectionIndex) == GoalConn)
-                    {
-                        GoalConnectionIndex = ConnectionIndex;
-                        break;
-                    }
-                }
-            }
-
-            UE_LOG(
-                train_pathing,
-                Verbose,
-                TEXT(
-                    "Resolved GoalConn=%p Track=%p TrackLength=%f "
-                    "ConnectionIndex=%d Opposite=%p"
-                ),
-                GoalConn,
-                GoalTrack,
-                GoalTrack ? GoalTrack->GetLength() : -1.0f,
-                GoalConnectionIndex,
-                GoalOpposite
-            );
-        }
-        LogPathSummary(Orig.Path, TEXT("Original"));
-        LogPathSummary(Result.Path, TEXT("Hooked"));
-
-        // quick comparison summary
-        int32 OrigNum = Orig.Path.IsValid() ? Orig.Path->PathPoints.Num() : 0;
-        int32 NewNum = Result.Path.IsValid() ? Result.Path->PathPoints.Num() : 0;
-        UE_LOG(train_pathing, Verbose, TEXT("PathCompare: OrigNum=%d NewNum=%d"), OrigNum, NewNum);
-
-        if (Orig.Path.IsValid() && Result.Path.IsValid())
-        {
-            int32 Min = FMath::Min(OrigNum, NewNum);
-            int32 DiffCount = 0;
-            for (int32 i = 0; i < Min; ++i)
-            {
-                UFGRailroadTrackConnectionComponent* O = Orig.Path->PathPoints[i].TrackConnection.Get();
-                UFGRailroadTrackConnectionComponent* N = Result.Path->PathPoints[i].TrackConnection.Get();
-                if (O != N) DiffCount++;
-            }
-            UE_LOG(train_pathing, Verbose, TEXT("PathCompare: first %d entries differ in %d places"), Min, DiffCount);
-        }
-
-        // Erweiterte Details beim Path-Vergleich
-        auto LogDetailedPoint = [](UFGRailroadTrackConnectionComponent* C, const FString& Tag, int32 Index)
-        {
-            if (!IsValid(C))
-            {
-                UE_LOG(train_pathing, Verbose, TEXT("  %s Pt[%d] Conn=null"), *Tag, Index);
-                return;
-            }
-
-            AFGBuildableRailroadTrack* T = C->GetTrack();
-            const TCHAR* OwnerName = C->GetOwner() ? *C->GetOwner()->GetName() : TEXT("unknown");
-            float TrackLength = T ? T->GetLength() : -1.0f;
-
-            FRailroadTrackPosition ConnPos = C->GetTrackPosition();
-            float ForwardOffset = ConnPos.IsValid() ? ConnPos.GetForwardOffset() : -1.0f;
-            float ReverseOffset = ConnPos.IsValid() ? ConnPos.GetReverseOffset() : -1.0f;
-
-            // If we can, find which connection index on the track this is (0 or 1)
-            int ConnIndex = INDEX_NONE;
-            if (T)
-            {
-                for (int i = 0; i < 2; ++i)
-                {
-                    if (T->GetConnection(i) == C)
-                    {
-                        ConnIndex = i;
-                        break;
-                    }
-                }
-            }
-
-            UE_LOG(train_pathing, Verbose, TEXT("  %s Pt[%d] Conn=%p Owner=%s Track=%p TrackLen=%f ConnIndex=%d ForwardOffset=%f ReverseOffset=%f"),
-                *Tag, Index, C, OwnerName, T, TrackLength, ConnIndex, ForwardOffset, ReverseOffset);
-        };
-
-        if (Orig.Path.IsValid())
-        {
-            for (int i = 0; i < Orig.Path->PathPoints.Num(); ++i)
-            {
-                LogDetailedPoint(Orig.Path->PathPoints[i].TrackConnection.Get(), TEXT("Original"), i);
-            }
-        }
-        if (Result.Path.IsValid())
-        {
-            for (int i = 0; i < Result.Path->PathPoints.Num(); ++i)
-            {
-                LogDetailedPoint(Result.Path->PathPoints[i].TrackConnection.Get(), TEXT("Hooked"), i);
-            }
-        }
-    }
-    */
-    scope.Override(Result);
+    scope.Override(FindPathSyncFrom(locomotive, StartConn, /*bIgnoredStart=*/true, station, filter));
 }
 
 
