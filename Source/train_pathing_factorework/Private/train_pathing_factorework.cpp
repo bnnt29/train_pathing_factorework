@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "train_pathing_factorework.h"
+#include "train_pathing_recalculation.h"
 #include "TrainPathingConfigStruct.h"
 #include "train_pathing_debug.h"
 
@@ -63,7 +64,7 @@ float CountVehiclesOnTrack(
 
             if (IsValid(Train))
             {
-                if (Train->IsPlayerDriven())
+                if (Train->mTrainStatus == ETrainStatus::TS_ManualDriving)
                 {
                     Counts += Config.Trains.PlayerDrivenTrainPenalty;
                 }
@@ -637,6 +638,7 @@ float FFactorioRailroadAStarFilter::CalculateFactorioPenalty(const FRailroadGrap
         return Penalty;
     }
     Penalty += CountStationPlatforms(EndNodeRef.TrackConnection, Config);
+    Penalty += CountStationPlatforms(EndNodeRef.TrackConnection->GetTrack()->GetConnection(1), Config)/4;
     Penalty += CountVehiclesOnTrack(Track, Config, IgnoredTrain);
     Penalty += CalculateTrackGeometryPenalty(
         StartNodeRef,
@@ -762,19 +764,6 @@ float FFactorioRailroadAStarFilter::GetTraversalCost(
 
         return 0.0f;
     }
-
-    UE_LOG(
-        train_pathing,
-        Verbose,
-        TEXT(
-            "EndTrack: %p (Con0: %p, Con1: %p), StartCon: %p, EndCon: %p"
-        ),
-        EndTrack,
-        EndTrack->GetConnection(0),
-        EndTrack->GetConnection(1),
-        StartNodeRef.TrackConnection,
-        EndNodeRef.TrackConnection
-    );
 
     const float BaseCost = EndTrack->GetLength();
 
@@ -1243,6 +1232,7 @@ void Ftrain_pathing_factoreworkModule::StartupModule()
             });
 
         TrainPathingDebug::Startup();
+		FSeamlessTrainPathingModule::Startup();
 
         UE_LOG(
             train_pathing,
@@ -1258,6 +1248,7 @@ void Ftrain_pathing_factoreworkModule::StartupModule()
 void Ftrain_pathing_factoreworkModule::ShutdownModule()
 {
     TrainPathingDebug::Shutdown();
+    FSeamlessTrainPathingModule::Shutdown();
 }
 
 #undef LOCTEXT_NAMESPACE
